@@ -529,34 +529,6 @@ Users then run `/add-telegram` on their fork and get clean code that does exactl
 
 ---
 
-## Community
-
-### 프로젝트 정보
-
-- **창시자:** Gavriel Cohen (전 Wix.com 7년 근무, Qwibit 공동 창업자)
-- **출시일:** 2026년 1월 31일
-- **GitHub 스타:** 7,000+ (출시 1주일)
-- **라이선스:** MIT
-
-### 참여
-
-- [Discord](https://discord.gg/VGWXrf8x) — 질문, 아이디어, 토론
-- [GitHub Issues](https://github.com/gavrielc/nanoclaw/issues) — 버그 리포트
-- [GitHub](https://github.com/gavrielc/nanoclaw) — 원본 저장소
-- [GitHub (Qwibit)](https://github.com/qwibitai/nanoclaw) — 활발한 개발 포크
-
-### 실제 사용 사례: Qwibit의 "Andy"
-
-창시자 Cohen 형제는 AI 마케팅 에이전시 Qwibit에서 NanoClaw 인스턴스 "Andy"를 다음과 같이 활용합니다:
-
-- 일~금 오전 9시 브리핑: 리드 상태 요약 및 작업 할당
-- 포워딩된 WhatsApp 메모와 이메일 스레드 파싱, Obsidian 볼트 및 SQLite DB 업데이트
-- 자동 팔로업 리마인더
-- git 히스토리 검토 등 반복 기술 작업
-- 미래 에이전트를 위한 자체 리팩토링
-
----
-
 ## License
 
 MIT — Copyright (c) 2026 Gavriel Cohen
