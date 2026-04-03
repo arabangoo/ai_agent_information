@@ -1,6 +1,5 @@
 import {
   type Component,
-  getEditorKeybindings,
   Input,
   isKeyRelease,
   matchesKey,
@@ -8,8 +7,11 @@ import {
   type SelectListTheme,
   truncateToWidth,
 } from "@mariozechner/pi-tui";
-import { visibleWidth } from "../../terminal/ansi.js";
-import { findWordBoundaryIndex, fuzzyFilterLower, prepareSearchItems } from "./fuzzy-filter.js";
+import { stripAnsi, visibleWidth } from "../../terminal/ansi.js";
+import { findWordBoundaryIndex, fuzzyFilterLower } from "./fuzzy-filter.js";
+
+const ANSI_ESCAPE = String.fromCharCode(27);
+const ANSI_SGR_REGEX = new RegExp(`${ANSI_ESCAPE}\\[[0-9;]*m`, "g");
 
 export interface SearchableSelectListTheme extends SelectListTheme {
   searchPrompt: (text: string) => string;
@@ -80,12 +82,15 @@ export class SearchableSelectList implements Component {
   private smartFilter(query: string): SelectItem[] {
     const q = query.toLowerCase();
     type ScoredItem = { item: SelectItem; tier: number; score: number };
+    type FuzzyCandidate = { item: SelectItem; searchTextLower: string };
     const scoredItems: ScoredItem[] = [];
-    const fuzzyCandidates: SelectItem[] = [];
+    const fuzzyCandidates: FuzzyCandidate[] = [];
 
     for (const item of this.items) {
-      const label = item.label.toLowerCase();
-      const desc = (item.description ?? "").toLowerCase();
+      const rawLabel = this.getItemLabel(item);
+      const rawDesc = item.description ?? "";
+      const label = stripAnsi(rawLabel).toLowerCase();
+      const desc = stripAnsi(rawDesc).toLowerCase();
 
       // Tier 1: Exact substring in label
       const labelIndex = label.indexOf(q);
@@ -106,15 +111,20 @@ export class SearchableSelectList implements Component {
         continue;
       }
       // Tier 4: Fuzzy match (score 300+)
-      fuzzyCandidates.push(item);
+      const searchText = (item as { searchText?: string }).searchText ?? "";
+      fuzzyCandidates.push({
+        item,
+        searchTextLower: [rawLabel, rawDesc, searchText]
+          .map((value) => stripAnsi(value))
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase(),
+      });
     }
 
     scoredItems.sort(this.compareByScore);
-
-    const preparedCandidates = prepareSearchItems(fuzzyCandidates);
-    const fuzzyMatches = fuzzyFilterLower(preparedCandidates, q);
-
-    return [...scoredItems.map((s) => s.item), ...fuzzyMatches];
+    const fuzzyMatches = fuzzyFilterLower(fuzzyCandidates, q);
+    return [...scoredItems.map((s) => s.item), ...fuzzyMatches.map((entry) => entry.item)];
   }
 
   private escapeRegex(str: string): string {
@@ -138,6 +148,25 @@ export class SearchableSelectList implements Component {
     return item.label || item.value;
   }
 
+  private splitAnsiParts(text: string): Array<{ text: string; isAnsi: boolean }> {
+    const parts: Array<{ text: string; isAnsi: boolean }> = [];
+    ANSI_SGR_REGEX.lastIndex = 0;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = ANSI_SGR_REGEX.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        parts.push({ text: text.slice(lastIndex, match.index), isAnsi: false });
+      }
+      parts.push({ text: match[0], isAnsi: true });
+      lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < text.length) {
+      parts.push({ text: text.slice(lastIndex), isAnsi: false });
+    }
+    return parts;
+  }
+
   private highlightMatch(text: string, query: string): string {
     const tokens = query
       .trim()
@@ -149,12 +178,26 @@ export class SearchableSelectList implements Component {
     }
 
     const uniqueTokens = Array.from(new Set(tokens)).toSorted((a, b) => b.length - a.length);
-    let result = text;
+    let parts = this.splitAnsiParts(text);
     for (const token of uniqueTokens) {
       const regex = this.getCachedRegex(token);
-      result = result.replace(regex, (match) => this.theme.matchHighlight(match));
+      const nextParts: Array<{ text: string; isAnsi: boolean }> = [];
+      for (const part of parts) {
+        if (part.isAnsi) {
+          nextParts.push(part);
+          continue;
+        }
+        regex.lastIndex = 0;
+        const replaced = part.text.replace(regex, (match) => this.theme.matchHighlight(match));
+        if (replaced === part.text) {
+          nextParts.push(part);
+          continue;
+        }
+        nextParts.push(...this.splitAnsiParts(replaced));
+      }
+      parts = nextParts;
     }
-    return result;
+    return parts.map((part) => part.text).join("");
   }
 
   setSelectedIndex(index: number) {
@@ -287,24 +330,14 @@ export class SearchableSelectList implements Component {
       return;
     }
 
-    const allowVimNav = !this.searchInput.getValue().trim();
-
     // Navigation keys
-    if (
-      matchesKey(keyData, "up") ||
-      matchesKey(keyData, "ctrl+p") ||
-      (allowVimNav && keyData === "k")
-    ) {
+    if (matchesKey(keyData, "up") || matchesKey(keyData, "ctrl+p")) {
       this.selectedIndex = Math.max(0, this.selectedIndex - 1);
       this.notifySelectionChange();
       return;
     }
 
-    if (
-      matchesKey(keyData, "down") ||
-      matchesKey(keyData, "ctrl+n") ||
-      (allowVimNav && keyData === "j")
-    ) {
+    if (matchesKey(keyData, "down") || matchesKey(keyData, "ctrl+n")) {
       this.selectedIndex = Math.min(this.filteredItems.length - 1, this.selectedIndex + 1);
       this.notifySelectionChange();
       return;
@@ -318,8 +351,7 @@ export class SearchableSelectList implements Component {
       return;
     }
 
-    const kb = getEditorKeybindings();
-    if (kb.matches(keyData, "selectCancel")) {
+    if (matchesKey(keyData, "escape") || keyData === "\u0003") {
       if (this.onCancel) {
         this.onCancel();
       }

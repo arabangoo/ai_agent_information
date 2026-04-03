@@ -1,4 +1,3 @@
-import type { MSTeamsTurnContext } from "../sdk-types.js";
 import {
   buildMSTeamsGraphMessageUrls,
   downloadMSTeamsAttachments,
@@ -8,6 +7,7 @@ import {
   type MSTeamsHtmlAttachmentSummary,
   type MSTeamsInboundMedia,
 } from "../attachments.js";
+import type { MSTeamsTurnContext } from "../sdk-types.js";
 
 type MSTeamsLogger = {
   debug?: (message: string, meta?: Record<string, unknown>) => void;
@@ -52,11 +52,11 @@ export async function resolveMSTeamsInboundMedia(params: {
   });
 
   if (mediaList.length === 0) {
-    const onlyHtmlAttachments =
+    const hasHtmlAttachment =
       attachments.length > 0 &&
-      attachments.every((att) => String(att.contentType ?? "").startsWith("text/html"));
+      attachments.some((att) => String(att.contentType ?? "").startsWith("text/html"));
 
-    if (onlyHtmlAttachments) {
+    if (hasHtmlAttachment) {
       const messageUrls = buildMSTeamsGraphMessageUrls({
         conversationType,
         conversationId,

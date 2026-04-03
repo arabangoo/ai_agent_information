@@ -1,20 +1,27 @@
 import { randomUUID } from "node:crypto";
-import type { ModelCatalogEntry } from "../agents/model-catalog.js";
-import type { OpenClawConfig } from "../config/config.js";
-import type { SessionEntry } from "../config/sessions.js";
 import { resolveDefaultAgentId } from "../agents/agent-scope.js";
-import { resolveAllowedModelRef, resolveDefaultModelForAgent } from "../agents/model-selection.js";
+import type { ModelCatalogEntry } from "../agents/model-catalog.js";
+import {
+  resolveAllowedModelRef,
+  resolveDefaultModelForAgent,
+  resolveSubagentConfiguredModelSelection,
+} from "../agents/model-selection.js";
 import { normalizeGroupActivation } from "../auto-reply/group-activation.js";
 import {
   formatThinkingLevels,
   formatXHighModelHint,
   normalizeElevatedLevel,
+  normalizeFastMode,
   normalizeReasoningLevel,
   normalizeThinkLevel,
   normalizeUsageDisplay,
   supportsXHighThinking,
 } from "../auto-reply/thinking.js";
+import type { OpenClawConfig } from "../config/config.js";
+import type { SessionEntry } from "../config/sessions.js";
+import { normalizeExecTarget } from "../infra/exec-approvals.js";
 import {
+  isAcpSessionKey,
   isSubagentSessionKey,
   normalizeAgentId,
   parseAgentSessionKey,
@@ -34,14 +41,6 @@ function invalid(message: string): { ok: false; error: ErrorShape } {
   return { ok: false, error: errorShape(ErrorCodes.INVALID_REQUEST, message) };
 }
 
-function normalizeExecHost(raw: string): "sandbox" | "gateway" | "node" | undefined {
-  const normalized = raw.trim().toLowerCase();
-  if (normalized === "sandbox" || normalized === "gateway" || normalized === "node") {
-    return normalized;
-  }
-  return undefined;
-}
-
 function normalizeExecSecurity(raw: string): "deny" | "allowlist" | "full" | undefined {
   const normalized = raw.trim().toLowerCase();
   if (normalized === "deny" || normalized === "allowlist" || normalized === "full") {
@@ -53,6 +52,26 @@ function normalizeExecSecurity(raw: string): "deny" | "allowlist" | "full" | und
 function normalizeExecAsk(raw: string): "off" | "on-miss" | "always" | undefined {
   const normalized = raw.trim().toLowerCase();
   if (normalized === "off" || normalized === "on-miss" || normalized === "always") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function supportsSpawnLineage(storeKey: string): boolean {
+  return isSubagentSessionKey(storeKey) || isAcpSessionKey(storeKey);
+}
+
+function normalizeSubagentRole(raw: string): "orchestrator" | "leaf" | undefined {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "orchestrator" || normalized === "leaf") {
+    return normalized;
+  }
+  return undefined;
+}
+
+function normalizeSubagentControlScope(raw: string): "children" | "none" | undefined {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "children" || normalized === "none") {
     return normalized;
   }
   return undefined;
@@ -70,6 +89,9 @@ export async function applySessionsPatchToStore(params: {
   const parsedAgent = parseAgentSessionKey(storeKey);
   const sessionAgentId = normalizeAgentId(parsedAgent?.agentId ?? resolveDefaultAgentId(cfg));
   const resolvedDefault = resolveDefaultModelForAgent({ cfg, agentId: sessionAgentId });
+  const subagentModelHint = isSubagentSessionKey(storeKey)
+    ? resolveSubagentConfiguredModelSelection({ cfg, agentId: sessionAgentId })
+    : undefined;
 
   const existing = store[storeKey];
   const next: SessionEntry = existing
@@ -90,13 +112,98 @@ export async function applySessionsPatchToStore(params: {
       if (!trimmed) {
         return invalid("invalid spawnedBy: empty");
       }
-      if (!isSubagentSessionKey(storeKey)) {
-        return invalid("spawnedBy is only supported for subagent:* sessions");
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("spawnedBy is only supported for subagent:* or acp:* sessions");
       }
       if (existing?.spawnedBy && existing.spawnedBy !== trimmed) {
         return invalid("spawnedBy cannot be changed once set");
       }
       next.spawnedBy = trimmed;
+    }
+  }
+
+  if ("spawnedWorkspaceDir" in patch) {
+    const raw = patch.spawnedWorkspaceDir;
+    if (raw === null) {
+      if (existing?.spawnedWorkspaceDir) {
+        return invalid("spawnedWorkspaceDir cannot be cleared once set");
+      }
+    } else if (raw !== undefined) {
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("spawnedWorkspaceDir is only supported for subagent:* or acp:* sessions");
+      }
+      const trimmed = String(raw).trim();
+      if (!trimmed) {
+        return invalid("invalid spawnedWorkspaceDir: empty");
+      }
+      if (existing?.spawnedWorkspaceDir && existing.spawnedWorkspaceDir !== trimmed) {
+        return invalid("spawnedWorkspaceDir cannot be changed once set");
+      }
+      next.spawnedWorkspaceDir = trimmed;
+    }
+  }
+
+  if ("spawnDepth" in patch) {
+    const raw = patch.spawnDepth;
+    if (raw === null) {
+      if (typeof existing?.spawnDepth === "number") {
+        return invalid("spawnDepth cannot be cleared once set");
+      }
+    } else if (raw !== undefined) {
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("spawnDepth is only supported for subagent:* or acp:* sessions");
+      }
+      const numeric = Number(raw);
+      if (!Number.isInteger(numeric) || numeric < 0) {
+        return invalid("invalid spawnDepth (use an integer >= 0)");
+      }
+      const normalized = numeric;
+      if (typeof existing?.spawnDepth === "number" && existing.spawnDepth !== normalized) {
+        return invalid("spawnDepth cannot be changed once set");
+      }
+      next.spawnDepth = normalized;
+    }
+  }
+
+  if ("subagentRole" in patch) {
+    const raw = patch.subagentRole;
+    if (raw === null) {
+      if (existing?.subagentRole) {
+        return invalid("subagentRole cannot be cleared once set");
+      }
+    } else if (raw !== undefined) {
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("subagentRole is only supported for subagent:* or acp:* sessions");
+      }
+      const normalized = normalizeSubagentRole(String(raw));
+      if (!normalized) {
+        return invalid('invalid subagentRole (use "orchestrator" or "leaf")');
+      }
+      if (existing?.subagentRole && existing.subagentRole !== normalized) {
+        return invalid("subagentRole cannot be changed once set");
+      }
+      next.subagentRole = normalized;
+    }
+  }
+
+  if ("subagentControlScope" in patch) {
+    const raw = patch.subagentControlScope;
+    if (raw === null) {
+      if (existing?.subagentControlScope) {
+        return invalid("subagentControlScope cannot be cleared once set");
+      }
+    } else if (raw !== undefined) {
+      if (!supportsSpawnLineage(storeKey)) {
+        return invalid("subagentControlScope is only supported for subagent:* or acp:* sessions");
+      }
+      const normalized = normalizeSubagentControlScope(String(raw));
+      if (!normalized) {
+        return invalid('invalid subagentControlScope (use "children" or "none")');
+      }
+      if (existing?.subagentControlScope && existing.subagentControlScope !== normalized) {
+        return invalid("subagentControlScope cannot be changed once set");
+      }
+      next.subagentControlScope = normalized;
     }
   }
 
@@ -139,6 +246,19 @@ export async function applySessionsPatchToStore(params: {
     }
   }
 
+  if ("fastMode" in patch) {
+    const raw = patch.fastMode;
+    if (raw === null) {
+      delete next.fastMode;
+    } else if (raw !== undefined) {
+      const normalized = normalizeFastMode(raw);
+      if (normalized === undefined) {
+        return invalid("invalid fastMode (use true or false)");
+      }
+      next.fastMode = normalized;
+    }
+  }
+
   if ("verboseLevel" in patch) {
     const raw = patch.verboseLevel;
     const parsed = parseVerboseOverride(raw);
@@ -157,11 +277,9 @@ export async function applySessionsPatchToStore(params: {
       if (!normalized) {
         return invalid('invalid reasoningLevel (use "on"|"off"|"stream")');
       }
-      if (normalized === "off") {
-        delete next.reasoningLevel;
-      } else {
-        next.reasoningLevel = normalized;
-      }
+      // Persist "off" explicitly so that resolveDefaultReasoningLevel()
+      // does not re-enable reasoning for capable models (#24406).
+      next.reasoningLevel = normalized;
     }
   }
 
@@ -201,9 +319,9 @@ export async function applySessionsPatchToStore(params: {
     if (raw === null) {
       delete next.execHost;
     } else if (raw !== undefined) {
-      const normalized = normalizeExecHost(String(raw));
+      const normalized = normalizeExecTarget(String(raw)) ?? undefined;
       if (!normalized) {
-        return invalid('invalid execHost (use "sandbox"|"gateway"|"node")');
+        return invalid('invalid execHost (use "auto"|"sandbox"|"gateway"|"node")');
       }
       next.execHost = normalized;
     }
@@ -276,7 +394,7 @@ export async function applySessionsPatchToStore(params: {
         catalog,
         raw: trimmed,
         defaultProvider: resolvedDefault.provider,
-        defaultModel: resolvedDefault.model,
+        defaultModel: subagentModelHint ?? resolvedDefault.model,
       });
       if ("error" in resolved) {
         return invalid(resolved.error);

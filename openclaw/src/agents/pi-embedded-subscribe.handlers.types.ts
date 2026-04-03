@@ -5,23 +5,17 @@ import type { InlineCodeState } from "../markdown/code-spans.js";
 import type { HookRunner } from "../plugins/hooks.js";
 import type { EmbeddedBlockChunker } from "./pi-embedded-block-chunker.js";
 import type { MessagingToolSend } from "./pi-embedded-messaging.js";
+import type { BlockReplyPayload } from "./pi-embedded-payloads.js";
 import type {
   BlockReplyChunking,
   SubscribeEmbeddedPiSessionParams,
 } from "./pi-embedded-subscribe.types.js";
+import type { ToolErrorSummary } from "./tool-error-summary.js";
 import type { NormalizedUsage } from "./usage.js";
 
 export type EmbeddedSubscribeLogger = {
-  debug: (message: string) => void;
-  warn: (message: string) => void;
-};
-
-export type ToolErrorSummary = {
-  toolName: string;
-  meta?: string;
-  error?: string;
-  mutatingAction?: boolean;
-  actionFingerprint?: string;
+  debug: (message: string, meta?: Record<string, unknown>) => void;
+  warn: (message: string, meta?: Record<string, unknown>) => void;
 };
 
 export type ToolCallSummary = {
@@ -52,6 +46,7 @@ export type EmbeddedPiSubscribeState = {
   emittedAssistantUpdate: boolean;
   lastStreamedReasoning?: string;
   lastBlockReplyText?: string;
+  reasoningStreamOpen: boolean;
   assistantMessageIndex: number;
   lastAssistantTextMessageIndex: number;
   lastAssistantTextNormalized?: string;
@@ -70,8 +65,14 @@ export type EmbeddedPiSubscribeState = {
   messagingToolSentTexts: string[];
   messagingToolSentTextsNormalized: string[];
   messagingToolSentTargets: MessagingToolSend[];
+  messagingToolSentMediaUrls: string[];
   pendingMessagingTexts: Map<string, string>;
   pendingMessagingTargets: Map<string, MessagingToolSend>;
+  successfulCronAdds: number;
+  pendingMessagingMediaUrls: Map<string, string[]>;
+  pendingToolMediaUrls: string[];
+  pendingToolAudioAsVoice: boolean;
+  deterministicApprovalPromptSent: boolean;
   lastAssistant?: AgentMessage;
 };
 
@@ -87,13 +88,13 @@ export type EmbeddedPiSubscribeContext = {
   shouldEmitToolResult: () => boolean;
   shouldEmitToolOutput: () => boolean;
   emitToolSummary: (toolName?: string, meta?: string) => void;
-  emitToolOutput: (toolName?: string, meta?: string, output?: string) => void;
+  emitToolOutput: (toolName?: string, meta?: string, output?: string, result?: unknown) => void;
   stripBlockTags: (
     text: string,
     state: { thinking: boolean; final: boolean; inlineCode?: InlineCodeState },
   ) => string;
-  emitBlockChunk: (text: string) => void;
-  flushBlockReplyBuffer: () => void;
+  emitBlockChunk: (text: string, options?: { assistantMessageIndex?: number }) => void;
+  flushBlockReplyBuffer: (options?: { assistantMessageIndex?: number }) => void | Promise<void>;
   emitReasoningStream: (text: string) => void;
   consumeReplyDirectives: (
     text: string,
@@ -119,6 +120,55 @@ export type EmbeddedPiSubscribeContext = {
   incrementCompactionCount: () => void;
   getUsageTotals: () => NormalizedUsage | undefined;
   getCompactionCount: () => number;
+  emitBlockReply: (payload: BlockReplyPayload) => void;
+};
+
+/**
+ * Minimal context type for tool execution handlers. Allows
+ * tests provide only the fields they exercise
+ * without needing the full `EmbeddedPiSubscribeContext`.
+ */
+export type ToolHandlerParams = Pick<
+  SubscribeEmbeddedPiSessionParams,
+  | "runId"
+  | "onBlockReplyFlush"
+  | "onAgentEvent"
+  | "onToolResult"
+  | "sessionKey"
+  | "sessionId"
+  | "agentId"
+>;
+
+export type ToolHandlerState = Pick<
+  EmbeddedPiSubscribeState,
+  | "toolMetaById"
+  | "toolMetas"
+  | "toolSummaryById"
+  | "lastToolError"
+  | "pendingMessagingTargets"
+  | "pendingMessagingTexts"
+  | "pendingMessagingMediaUrls"
+  | "pendingToolMediaUrls"
+  | "pendingToolAudioAsVoice"
+  | "messagingToolSentTexts"
+  | "messagingToolSentTextsNormalized"
+  | "messagingToolSentMediaUrls"
+  | "messagingToolSentTargets"
+  | "successfulCronAdds"
+  | "deterministicApprovalPromptSent"
+>;
+
+export type ToolHandlerContext = {
+  params: ToolHandlerParams;
+  state: ToolHandlerState;
+  log: EmbeddedSubscribeLogger;
+  hookRunner?: HookRunner;
+  flushBlockReplyBuffer: () => void | Promise<void>;
+  shouldEmitToolResult: () => boolean;
+  shouldEmitToolOutput: () => boolean;
+  emitToolSummary: (toolName?: string, meta?: string) => void;
+  emitToolOutput: (toolName?: string, meta?: string, output?: string, result?: unknown) => void;
+  trimMessagingToolSent: () => void;
 };
 
 export type EmbeddedPiSubscribeEvent =

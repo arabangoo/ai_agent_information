@@ -1,39 +1,77 @@
-import { describe, expect, it } from "vitest";
-import { isReasoningTagProvider } from "./provider-utils.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const { resolveProviderReasoningOutputModeWithPluginMock } = vi.hoisted(() => ({
+  resolveProviderReasoningOutputModeWithPluginMock: vi.fn(),
+}));
+
+vi.mock("../plugins/provider-runtime.js", () => ({
+  resolveProviderReasoningOutputModeWithPlugin: resolveProviderReasoningOutputModeWithPluginMock,
+}));
+
+import { isReasoningTagProvider, resolveReasoningOutputMode } from "./provider-utils.js";
+
+describe("resolveReasoningOutputMode", () => {
+  beforeEach(() => {
+    resolveProviderReasoningOutputModeWithPluginMock.mockReset();
+    resolveProviderReasoningOutputModeWithPluginMock.mockReturnValue(undefined);
+  });
+
+  it.each([
+    ["google", "tagged"],
+    ["Google", "tagged"],
+    ["google-gemini-cli", "tagged"],
+    ["google-generative-ai", "tagged"],
+    ["anthropic", "native"],
+    ["openai", "native"],
+    ["openrouter", "native"],
+    ["ollama", "native"],
+    ["minimax", "native"],
+    ["minimax-cn", "native"],
+  ] as const)("uses the built-in fast path for %s", (provider, expected) => {
+    expect(resolveReasoningOutputMode({ provider, workspaceDir: process.cwd() })).toBe(expected);
+    expect(resolveProviderReasoningOutputModeWithPluginMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to provider hooks for unknown providers", () => {
+    resolveProviderReasoningOutputModeWithPluginMock.mockReturnValue("tagged");
+
+    expect(
+      resolveReasoningOutputMode({
+        provider: "custom-provider",
+        workspaceDir: process.cwd(),
+        modelId: "custom/model",
+      }),
+    ).toBe("tagged");
+    expect(resolveProviderReasoningOutputModeWithPluginMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns native when hooks do not provide an override", () => {
+    expect(resolveReasoningOutputMode({ provider: "custom-provider" })).toBe("native");
+    expect(resolveProviderReasoningOutputModeWithPluginMock).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("isReasoningTagProvider", () => {
-  it("returns false for ollama - native reasoning field, no tags needed (#2279)", () => {
-    expect(isReasoningTagProvider("ollama")).toBe(false);
-    expect(isReasoningTagProvider("Ollama")).toBe(false);
+  beforeEach(() => {
+    resolveProviderReasoningOutputModeWithPluginMock.mockReset();
+    resolveProviderReasoningOutputModeWithPluginMock.mockReturnValue(undefined);
   });
 
-  it("returns true for google-gemini-cli", () => {
-    expect(isReasoningTagProvider("google-gemini-cli")).toBe(true);
-  });
-
-  it("returns true for google-generative-ai", () => {
-    expect(isReasoningTagProvider("google-generative-ai")).toBe(true);
-  });
-
-  it("returns true for google-antigravity", () => {
-    expect(isReasoningTagProvider("google-antigravity")).toBe(true);
-    expect(isReasoningTagProvider("google-antigravity/gemini-3")).toBe(true);
-  });
-
-  it("returns true for minimax", () => {
-    expect(isReasoningTagProvider("minimax")).toBe(true);
-    expect(isReasoningTagProvider("minimax-cn")).toBe(true);
-  });
-
-  it("returns false for null/undefined/empty", () => {
-    expect(isReasoningTagProvider(null)).toBe(false);
-    expect(isReasoningTagProvider(undefined)).toBe(false);
-    expect(isReasoningTagProvider("")).toBe(false);
-  });
-
-  it("returns false for standard providers", () => {
-    expect(isReasoningTagProvider("anthropic")).toBe(false);
-    expect(isReasoningTagProvider("openai")).toBe(false);
-    expect(isReasoningTagProvider("openrouter")).toBe(false);
+  it.each([
+    ["google", true],
+    ["Google", true],
+    ["google-gemini-cli", true],
+    ["google-generative-ai", true],
+    ["anthropic", false],
+    ["openai", false],
+    ["openrouter", false],
+    ["ollama", false],
+    ["minimax", false],
+    ["minimax-cn", false],
+    [null, false],
+    [undefined, false],
+    ["", false],
+  ] as const)("returns %s for %s", (value, expected) => {
+    expect(isReasoningTagProvider(value, { workspaceDir: process.cwd() })).toBe(expected);
   });
 });

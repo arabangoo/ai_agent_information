@@ -1,11 +1,15 @@
 import type {
   BlockStreamingCoalesceConfig,
+  ContextVisibilityMode,
   DmPolicy,
   GroupPolicy,
   MarkdownConfig,
   ReplyToMode,
 } from "./types.base.js";
-import type { ChannelHeartbeatVisibilityConfig } from "./types.channels.js";
+import type {
+  ChannelHealthMonitorConfig,
+  ChannelHeartbeatVisibilityConfig,
+} from "./types.channels.js";
 import type { DmConfig, ProviderCommandsConfig } from "./types.messages.js";
 import type { GroupToolPolicyBySenderConfig, GroupToolPolicyConfig } from "./types.tools.js";
 
@@ -45,6 +49,25 @@ export type SlackChannelConfig = {
 };
 
 export type SlackReactionNotificationMode = "off" | "own" | "all" | "allowlist";
+export type SlackStreamingMode = "off" | "partial" | "block" | "progress";
+export type SlackExecApprovalTarget = "dm" | "channel" | "both";
+export type SlackExecApprovalConfig = {
+  /** Enable mode for Slack exec approvals on this account. Default: auto when approvers can be resolved; false disables. */
+  enabled?: import("./types.approvals.js").NativeExecApprovalEnableMode;
+  /** Slack user IDs allowed to approve exec requests. Optional: falls back to commands.ownerAllowFrom when possible. */
+  approvers?: Array<string | number>;
+  /** Only forward approvals for these agent IDs. Omit = all agents. */
+  agentFilter?: string[];
+  /** Only forward approvals matching these session key patterns (substring or regex). */
+  sessionFilter?: string[];
+  /** Where to send approval prompts. Default: "dm". */
+  target?: SlackExecApprovalTarget;
+};
+export type SlackCapabilitiesConfig =
+  | string[]
+  | {
+      interactiveReplies?: boolean;
+    };
 
 export type SlackActionConfig = {
   reactions?: boolean;
@@ -87,7 +110,9 @@ export type SlackAccountConfig = {
   /** Slack Events API webhook path (default: /slack/events). */
   webhookPath?: string;
   /** Optional provider capability tags used for agent/runtime guidance. */
-  capabilities?: string[];
+  capabilities?: SlackCapabilitiesConfig;
+  /** Slack-native exec approval delivery + approver authorization. */
+  execApprovals?: SlackExecApprovalConfig;
   /** Markdown formatting overrides (tables). */
   markdown?: MarkdownConfig;
   /** Override native command registration for Slack (bool or "auto"). */
@@ -103,6 +128,11 @@ export type SlackAccountConfig = {
   userTokenReadOnly?: boolean;
   /** Allow bot-authored messages to trigger replies (default: false). */
   allowBots?: boolean;
+  /**
+   * Break-glass override: allow mutable identity matching (name/slug) in allowlists.
+   * Default behavior is ID-only matching.
+   */
+  dangerouslyAllowNameMatching?: boolean;
   /** Default mention requirement for channel messages (default: true). */
   requireMention?: boolean;
   /**
@@ -112,6 +142,8 @@ export type SlackAccountConfig = {
    * - "allowlist": only allow channels present in channels.slack.channels
    */
   groupPolicy?: GroupPolicy;
+  /** Supplemental context visibility policy (all|allowlist|allowlist_quote). */
+  contextVisibility?: ContextVisibilityMode;
   /** Max channel messages to keep as history context (0 disables). */
   historyLimit?: number;
   /** Max DM turns to keep as history context. */
@@ -124,6 +156,21 @@ export type SlackAccountConfig = {
   blockStreaming?: boolean;
   /** Merge streamed block replies before sending. */
   blockStreamingCoalesce?: BlockStreamingCoalesceConfig;
+  /**
+   * Stream preview mode:
+   * - "off": disable live preview streaming
+   * - "partial": replace preview text with the latest partial output (default)
+   * - "block": append chunked preview updates
+   * - "progress": show progress status, then send final text
+   */
+  streaming?: SlackStreamingMode;
+  /** @deprecated Legacy draft streaming mode; normalized into `streaming` on load. */
+  streamMode?: "replace" | "status_final" | "append";
+  /**
+   * Slack native text streaming toggle (`chat.startStream` / `chat.appendStream` / `chat.stopStream`).
+   * Used when `streaming` is `partial`. Default: true.
+   */
+  nativeStreaming?: boolean;
   mediaMaxMb?: number;
   /** Reaction notification mode (off|own|all|allowlist). Default: own. */
   reactionNotifications?: SlackReactionNotificationMode;
@@ -150,15 +197,34 @@ export type SlackAccountConfig = {
    * Legacy key: channels.slack.dm.allowFrom.
    */
   allowFrom?: Array<string | number>;
+  /** Default delivery target for CLI --deliver when no explicit --reply-to is provided. */
+  defaultTo?: string;
   dm?: SlackDmConfig;
   channels?: Record<string, SlackChannelConfig>;
   /** Heartbeat visibility settings for this channel. */
   heartbeat?: ChannelHeartbeatVisibilityConfig;
+  /** Channel health monitor overrides for this channel/account. */
+  healthMonitor?: ChannelHealthMonitorConfig;
   /** Outbound response prefix override for this channel/account. */
   responsePrefix?: string;
+  /**
+   * Per-channel ack reaction override.
+   * Slack uses shortcodes (e.g., "eyes") rather than unicode emoji.
+   */
+  ackReaction?: string;
+  /** Reaction emoji added while processing a reply (e.g. "hourglass_flowing_sand"). Removed when done. Useful as a typing indicator fallback when assistant mode is not enabled. */
+  typingReaction?: string;
 };
 
 export type SlackConfig = {
   /** Optional per-account Slack configuration (multi-account). */
   accounts?: Record<string, SlackAccountConfig>;
+  /** Optional default account id when multiple accounts are configured. */
+  defaultAccount?: string;
 } & SlackAccountConfig;
+
+declare module "./types.channels.js" {
+  interface ChannelsConfig {
+    slack?: SlackConfig;
+  }
+}
