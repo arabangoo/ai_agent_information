@@ -1,21 +1,34 @@
 """
-MultiClaw Agent Executor - 에이전트 실행 엔진
-작업 분석 → 투표 → 실행 → 응답의 전체 흐름 관리
+MultiClaw Agent Executor
+
+Pipeline:
+1. Plan
+2. Validate
+3. Policy check
+4. Execute
+5. Audit
 """
+
+from __future__ import annotations
 
 import json
 import re
-from typing import Dict, Any, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List
 
 from ai_manager import AIManager
 from agent_tools import TOOL_REGISTRY, execute_tool, get_tools_description
-from voting_system import VotingSystem
+from cancellation_manager import CancellationManager
 from memory_manager import MemoryManager
+from runtime_config import RuntimeConfig, get_runtime_config
+from session_context import SessionContext
+from tool_policy import ToolPolicy
+from voting_system import VotingSystem
 
 
-PLAN_PROMPT_TEMPLATE = """당신은 멀티클로(MultiClaw) AI 에이전트입니다.
-사용자의 요청을 분석하여 어떤 도구를 사용할지 계획을 세워주세요.
+PLAN_PROMPT_TEMPLATE = """당신은 MultiClaw의 로컬 시스템 에이전트 플래너입니다.
+MultiClaw는 로컬 파일 읽기/쓰기, 디렉토리 조회, 시스템 명령 실행, 웹 검색을 실제로 수행할 수 있습니다.
+사용자가 파일/폴더/경로/명령/검색을 요청하면 도구를 써야 하며, 로컬 시스템 접근이 불가능하다고 말하면 안 됩니다.
 
 사용 가능한 도구:
 {tools_description}
@@ -24,284 +37,443 @@ PLAN_PROMPT_TEMPLATE = """당신은 멀티클로(MultiClaw) AI 에이전트입�
 
 {memory_context}
 
-반드시 아래 JSON 형식으로만 답변하세요 (다른 텍스트 없이):
+중요 규칙:
+- 파일, 폴더, 경로, 드라이브(C:\\ 등), 확장자, 생성/수정/삭제/읽기/목록/검색 요청이 있으면 반드시 도구 계획을 만드세요.
+- 일반 대화가 아닌 이상 "도구 없이 답변"으로 빼지 마세요.
+- 상대 경로와 절대 경로를 모두 사용할 수 있습니다.
+- JSON 외 텍스트를 절대 출력하지 마세요.
+
+반드시 JSON만 반환:
 {{
-    "plan": [
-        {{
-            "tool": "도구이름",
-            "params": {{"key": "value"}},
-            "description": "이 단계에서 할 일"
-        }}
-    ],
-    "explanation": "전체 계획 설명"
+  "plan": [
+    {{
+      "tool": "tool_name",
+      "params": {{"key": "value"}},
+      "description": "이 단계에서 수행할 작업"
+    }}
+  ],
+  "explanation": "전체 작업 계획 설명"
 }}
 
-도구가 필요 없는 일반 질문이면:
+정말로 도구가 필요 없는 순수 일반 대화일 때만:
 {{
-    "plan": [],
-    "explanation": "일반 대화 - 도구 사용 불필요"
+  "plan": [],
+  "explanation": "일반 대화 - 도구 사용 불필요"
 }}"""
 
 
-FINAL_RESPONSE_PROMPT = """당신은 멀티클로(MultiClaw) AI 에이전트입니다.
-에이전트 작업이 완료되었습니다. 결과를 사용자에게 알기 쉽게 설명해주세요.
+FINAL_RESPONSE_PROMPT = """당신은 MultiClaw입니다.
+아래 작업은 이미 실제로 실행되었고, 결과도 확보되어 있습니다.
+로컬 파일이나 시스템에 접근할 수 없다고 말하지 말고, 실행 결과를 바탕으로 사용자에게 명확히 설명하세요.
 
 사용자 요청: {user_message}
-실행된 작업과 결과:
+실행 결과:
 {execution_results}
 
-투표 정보:
+검증 및 투표 결과:
 {vote_summary}
-
-결과를 한국어로 명확하고 친절하게 설명해주세요."""
+"""
 
 
 class AgentExecutor:
-    """멀티클로 에이전트 실행 엔진"""
-
     def __init__(
         self,
         ai_manager: AIManager,
         voting_system: VotingSystem,
         memory_manager: MemoryManager,
+        tool_policy: ToolPolicy,
+        cancellation_manager: CancellationManager,
+        runtime_config: RuntimeConfig | None = None,
     ):
         self.ai_manager = ai_manager
         self.voting_system = voting_system
         self.memory_manager = memory_manager
+        self.tool_policy = tool_policy
+        self.cancellation_manager = cancellation_manager
+        self.runtime_config = runtime_config or get_runtime_config()
 
-    async def _create_plan(self, user_message: str) -> Dict[str, Any]:
-        """AI에게 작업 계획 생성 요청"""
-        memory_context = self.memory_manager.get_context_for_chat()
-        if memory_context:
-            memory_context = f"\n참고할 메모리:\n{memory_context}"
-        else:
-            memory_context = ""
+    def _looks_like_live_web_query(self, user_message: str) -> bool:
+        message = user_message.lower()
+        keywords = [
+            "latest",
+            "recent",
+            "today",
+            "news",
+            "current",
+            "up-to-date",
+            "search the web",
+            "web search",
+            "look up",
+            "최신",
+            "최근",
+            "오늘",
+            "뉴스",
+            "실시간",
+            "웹검색",
+            "웹 검색",
+            "찾아봐",
+            "검색해",
+        ]
+        return any(keyword in message for keyword in keywords)
 
+    def _should_force_web_search(
+        self, user_message: str, plan_result: Dict[str, Any]
+    ) -> bool:
+        planned_tools = [
+            step.get("tool")
+            for step in plan_result.get("plan", [])
+            if isinstance(step, dict)
+        ]
+        if "web_search" in planned_tools or "fetch_url" in planned_tools:
+            return False
+        return self._looks_like_live_web_query(user_message)
+
+    def _build_fallback_web_plan(self, user_message: str) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "plan": [
+                {
+                    "tool": "web_search",
+                    "params": {"query": user_message, "max_results": 5},
+                    "description": "Search the live web for current information relevant to the request.",
+                }
+            ],
+            "explanation": (
+                "Injected a live web search step because the request appears to need "
+                "current or externally verified information."
+            ),
+            "planner": "system-fallback",
+        }
+
+    def _check_cancelled(self, session_context: SessionContext) -> None:
+        self.cancellation_manager.raise_if_cancelled(session_context.session_id)
+
+    async def _create_plan(
+        self, user_message: str, session_context: SessionContext
+    ) -> Dict[str, Any]:
+        memory_context = self.memory_manager.get_context_for_chat(
+            session_id=session_context.session_id
+        )
         prompt = PLAN_PROMPT_TEMPLATE.format(
             tools_description=get_tools_description(),
             user_message=user_message,
-            memory_context=memory_context,
+            memory_context=(
+                f"Relevant memory:\n{memory_context}" if memory_context else "No memory context."
+            ),
         )
 
-        # Gemini를 기본 플래너로 사용 (가장 빠르고 JSON 파싱이 좋음)
         available = self.ai_manager.get_available_ais()
         planner_ai = "Gemini" if "Gemini" in available else available[0]
+        response = await self.ai_manager.get_response(
+            ai_name=planner_ai,
+            message=prompt,
+            context=None,
+            history=None,
+            file_search_context=None,
+        )
+
+        json_match = re.search(r"\{[\s\S]*\}", response)
+        if not json_match:
+            return {
+                "success": False,
+                "plan": [],
+                "explanation": "planner did not return valid JSON",
+                "planner": planner_ai,
+                "raw_response": response,
+            }
 
         try:
-            response = await self.ai_manager.get_response(
-                ai_name=planner_ai,
-                message=prompt,
-                context=None,
-                history=None,
-                file_search_context=None,
-            )
-
-            # JSON 추출 (코드블록 안에 있을 수 있음)
-            json_match = re.search(r"\{[\s\S]*\}", response)
-            if json_match:
-                plan_data = json.loads(json_match.group())
-                return {
-                    "success": True,
-                    "plan": plan_data.get("plan", []),
-                    "explanation": plan_data.get("explanation", ""),
-                    "planner": planner_ai,
-                }
-            else:
-                return {
-                    "success": False,
-                    "plan": [],
-                    "explanation": "계획을 파싱할 수 없습니다",
-                    "planner": planner_ai,
-                    "raw_response": response,
-                }
+            payload = json.loads(json_match.group())
         except json.JSONDecodeError:
             return {
                 "success": False,
                 "plan": [],
-                "explanation": "JSON 파싱 실패",
+                "explanation": "planner JSON parsing failed",
                 "planner": planner_ai,
+                "raw_response": response,
             }
-        except Exception as e:
-            return {
-                "success": False,
-                "plan": [],
-                "explanation": f"계획 생성 실패: {str(e)}",
-                "planner": planner_ai,
-            }
+
+        return {
+            "success": True,
+            "plan": payload.get("plan", []),
+            "explanation": payload.get("explanation", ""),
+            "planner": planner_ai,
+        }
+
+    def _validate_plan(self, plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        validated_steps = []
+        for index, step in enumerate(plan, start=1):
+            tool_name = step.get("tool", "")
+            params = step.get("params", {})
+            description = step.get("description", "") or f"Step {index}"
+            validation_errors: List[str] = []
+
+            if not tool_name:
+                validation_errors.append("tool is required")
+            elif not TOOL_REGISTRY.has(tool_name):
+                validation_errors.append(f"unknown tool: {tool_name}")
+
+            if not isinstance(params, dict):
+                validation_errors.append("params must be an object")
+                params = {}
+
+            tool = TOOL_REGISTRY.get(tool_name) if tool_name else None
+            if tool is not None:
+                validation_errors.extend(tool.validate_params(params))
+
+            validated_steps.append(
+                {
+                    "step": index,
+                    "tool": tool_name,
+                    "params": params,
+                    "description": description,
+                    "validation": {
+                        "valid": len(validation_errors) == 0,
+                        "errors": validation_errors,
+                    },
+                }
+            )
+
+        return validated_steps
 
     async def _generate_final_response(
         self,
         user_message: str,
-        execution_results: List[Dict],
+        execution_results: List[Dict[str, Any]],
         vote_summaries: List[str],
     ) -> Dict[str, str]:
-        """3개 AI에게 최종 응답 생성 요청"""
-        results_text = ""
-        for i, result in enumerate(execution_results, 1):
-            results_text += f"\n[단계 {i}] {result.get('description', '')}\n"
-            results_text += f"도구: {result.get('tool', '')}\n"
-            results_text += f"결과: {json.dumps(result.get('result', {}), ensure_ascii=False, indent=2)[:1000]}\n"
-
-        vote_text = "\n".join(vote_summaries) if vote_summaries else "투표 없음"
+        results_text = []
+        for item in execution_results:
+            results_text.append(
+                json.dumps(
+                    {
+                        "tool": item.get("tool"),
+                        "description": item.get("description"),
+                        "result": item.get("result"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )[:1200]
+            )
 
         prompt = FINAL_RESPONSE_PROMPT.format(
             user_message=user_message,
-            execution_results=results_text,
-            vote_summary=vote_text,
+            execution_results="\n\n".join(results_text) if results_text else "No tool execution.",
+            vote_summary="\n".join(vote_summaries) if vote_summaries else "No vote",
         )
 
-        # 모든 사용 가능한 AI에게 최종 응답 요청
-        available_ais = self.ai_manager.get_available_ais()
-        responses = {}
-
-        for ai_name in available_ais:
+        responses: Dict[str, str] = {}
+        for ai_name in self.ai_manager.get_available_ais():
             try:
-                resp = await self.ai_manager.get_response(
+                responses[ai_name] = await self.ai_manager.get_response(
                     ai_name=ai_name,
                     message=prompt,
                     context=None,
                     history=None,
                     file_search_context=None,
                 )
-                responses[ai_name] = resp
-            except Exception as e:
-                responses[ai_name] = f"응답 생성 실패: {str(e)}"
-
+            except Exception as exc:
+                responses[ai_name] = f"response generation failed: {exc}"
         return responses
 
-    async def execute(self, user_message: str) -> Dict[str, Any]:
-        """
-        에이전트 명령 실행 - 전체 흐름
+    def _audit_log(
+        self,
+        session_context: SessionContext,
+        user_message: str,
+        result: Dict[str, Any],
+    ) -> None:
+        audit_payload = {
+            "request": user_message,
+            "approved": result.get("approved", False),
+            "summary": result.get("summary", ""),
+            "steps": [
+                {
+                    "step": step.get("step"),
+                    "tool": step.get("tool"),
+                    "validation": step.get("validation"),
+                    "policy": step.get("policy"),
+                    "vote_summary": step.get("vote", {}).get("summary")
+                    if isinstance(step.get("vote"), dict)
+                    else None,
+                    "success": (
+                        step.get("result", {}).get("success")
+                        if isinstance(step.get("result"), dict)
+                        else None
+                    ),
+                }
+                for step in result.get("steps", [])
+            ],
+        }
+        self.memory_manager.save_memory(
+            json.dumps(audit_payload, ensure_ascii=False, indent=2),
+            category="agent_audit",
+            session_id=session_context.session_id,
+        )
 
-        Returns:
-            {
-                "plan": {...},
-                "steps": [{vote, execution, ...}, ...],
-                "ai_responses": {"GPT": "...", "Claude": "...", "Gemini": "..."},
-                "approved": bool,
-                "summary": str
-            }
-        """
-        timestamp = datetime.now()
-        result = {
+    async def execute(
+        self, user_message: str, session_context: SessionContext
+    ) -> Dict[str, Any]:
+        started_at = datetime.now().isoformat()
+        self._check_cancelled(session_context)
+        result: Dict[str, Any] = {
+            "session_id": session_context.session_id,
+            "started_at": started_at,
             "plan": None,
             "steps": [],
             "ai_responses": {},
             "approved": True,
             "summary": "",
+            "pipeline": {
+                "plan": "pending",
+                "validate": "pending",
+                "policy": "pending",
+                "execute": "pending",
+                "audit": "pending",
+            },
         }
 
-        # Step 1: 작업 계획 생성
-        print(f"\n{'='*60}")
-        print(f"🦀 멀티클로 에이전트 실행")
-        print(f"📋 요청: {user_message}")
-        print(f"{'='*60}")
-
-        plan_result = await self._create_plan(user_message)
+        plan_result = await self._create_plan(user_message, session_context)
+        self._check_cancelled(session_context)
+        if self._should_force_web_search(user_message, plan_result):
+            plan_result = self._build_fallback_web_plan(user_message)
         result["plan"] = plan_result
+        result["pipeline"]["plan"] = "completed" if plan_result.get("success") else "failed"
 
         if not plan_result.get("plan"):
-            # 도구 사용이 필요 없는 일반 질문
-            print("💬 일반 대화 모드 (도구 사용 불필요)")
             responses = {}
-            available_ais = self.ai_manager.get_available_ais()
-            for ai_name in available_ais:
-                try:
-                    resp = await self.ai_manager.get_response(
-                        ai_name=ai_name,
-                        message=user_message,
-                        context=None,
-                        history=None,
-                        file_search_context=None,
-                    )
-                    responses[ai_name] = resp
-                except Exception as e:
-                    responses[ai_name] = f"응답 실패: {str(e)}"
-
+            for ai_name in self.ai_manager.get_available_ais():
+                self._check_cancelled(session_context)
+                responses[ai_name] = await self.ai_manager.get_response(
+                    ai_name=ai_name,
+                    message=user_message,
+                    context=None,
+                    history=None,
+                    file_search_context=None,
+                )
             result["ai_responses"] = responses
-            result["summary"] = "일반 대화 - 에이전트 도구 사용 없음"
+            result["summary"] = "answered without tool execution"
+            result["pipeline"]["validate"] = "completed"
+            result["pipeline"]["policy"] = "completed"
+            result["pipeline"]["execute"] = "completed"
+            self._audit_log(session_context, user_message, result)
+            result["pipeline"]["audit"] = "completed"
             return result
 
-        print(f"📋 계획: {plan_result.get('explanation', '')}")
-        print(f"🔧 실행할 도구: {len(plan_result['plan'])}개")
+        validated_steps = self._validate_plan(plan_result["plan"])
+        result["steps"] = validated_steps
+        result["pipeline"]["validate"] = "completed"
 
-        # Step 2: 각 단계별로 투표 → 실행
-        execution_results = []
-        vote_summaries = []
-        all_approved = True
+        execution_results: List[Dict[str, Any]] = []
+        vote_summaries: List[str] = []
 
-        for i, step in enumerate(plan_result["plan"], 1):
-            tool_name = step.get("tool", "")
-            params = step.get("params", {})
-            description = step.get("description", "")
+        for step in result["steps"]:
+            self._check_cancelled(session_context)
+            if not step["validation"]["valid"]:
+                step["policy"] = {"allowed": False, "reason": "validation failed"}
+                step["vote"] = {
+                    "approved": False,
+                    "approve_count": 0,
+                    "reject_count": 0,
+                    "total_voters": 0,
+                    "votes": [],
+                    "summary": "validation failed",
+                }
+                step["result"] = {
+                    "success": False,
+                    "error": "; ".join(step["validation"]["errors"]),
+                }
+                result["approved"] = False
+                result["summary"] = "agent plan validation failed"
+                result["pipeline"]["policy"] = "completed"
+                result["pipeline"]["execute"] = "failed"
+                self._audit_log(session_context, user_message, result)
+                result["pipeline"]["audit"] = "completed"
+                return result
 
-            print(f"\n--- 단계 {i}: {description} ---")
-
-            # 투표
-            vote_result = await self.voting_system.conduct_vote(
-                user_command=user_message,
-                tool_name=tool_name,
-                parameters=params,
-            )
-
-            step_result = {
-                "step": i,
-                "tool": tool_name,
-                "params": params,
-                "description": description,
-                "vote": vote_result,
-                "result": None,
+            policy_decision = self.tool_policy.assess(step["tool"], step["params"])
+            step["policy"] = {
+                "allowed": policy_decision.allowed,
+                "reason": policy_decision.reason,
             }
 
-            vote_summaries.append(
-                f"단계 {i} ({tool_name}): {vote_result['summary']}"
+            if not policy_decision.allowed:
+                step["vote"] = {
+                    "approved": False,
+                    "approve_count": 0,
+                    "reject_count": 0,
+                    "total_voters": 0,
+                    "votes": [],
+                    "summary": "blocked by tool policy",
+                }
+                step["result"] = {
+                    "success": False,
+                    "error": policy_decision.reason,
+                    "blocked": True,
+                }
+                result["approved"] = False
+                result["summary"] = "agent request blocked by policy"
+                result["pipeline"]["policy"] = "completed"
+                result["pipeline"]["execute"] = "failed"
+                self._audit_log(session_context, user_message, result)
+                result["pipeline"]["audit"] = "completed"
+                return result
+
+            step["params"] = policy_decision.normalized_params
+
+            vote_result = await self.voting_system.conduct_vote(
+                user_command=user_message,
+                tool_name=step["tool"],
+                parameters=step["params"],
+            )
+            self._check_cancelled(session_context)
+            step["vote"] = vote_result
+            vote_summaries.append(f"step {step['step']} ({step['tool']}): {vote_result['summary']}")
+
+            if not vote_result["approved"]:
+                step["result"] = {
+                    "success": False,
+                    "error": f"vote rejected: {vote_result['summary']}",
+                }
+                result["approved"] = False
+                result["summary"] = "agent request rejected by vote"
+                result["pipeline"]["policy"] = "completed"
+                result["pipeline"]["execute"] = "failed"
+                self._audit_log(session_context, user_message, result)
+                result["pipeline"]["audit"] = "completed"
+                return result
+
+            tool_result = await execute_tool(
+                step["tool"],
+                step["params"],
+                session_context=session_context,
+                tool_policy=self.tool_policy,
+            )
+            self._check_cancelled(session_context)
+            step["result"] = tool_result
+            execution_results.append(
+                {
+                    "tool": step["tool"],
+                    "description": step["description"],
+                    "result": tool_result,
+                }
             )
 
-            if vote_result["approved"]:
-                # 투표 통과 → 도구 실행
-                print(f"✅ 투표 통과 → 도구 실행: {tool_name}")
-                tool_result = await execute_tool(tool_name, params)
-                step_result["result"] = tool_result
-                execution_results.append({
-                    "tool": tool_name,
-                    "description": description,
-                    "result": tool_result,
-                })
-            else:
-                # 투표 거부
-                print(f"❌ 투표 거부 → 실행 중단: {tool_name}")
-                step_result["result"] = {
-                    "success": False,
-                    "error": f"투표에서 거부됨: {vote_result['summary']}",
-                }
-                all_approved = False
-                # 거부된 단계 이후는 실행하지 않음
-                result["steps"].append(step_result)
-                break
+            if not tool_result.get("success", False):
+                result["approved"] = False
+                result["summary"] = "tool execution failed"
+                result["pipeline"]["policy"] = "completed"
+                result["pipeline"]["execute"] = "failed"
+                self._audit_log(session_context, user_message, result)
+                result["pipeline"]["audit"] = "completed"
+                return result
 
-            result["steps"].append(step_result)
-
-        result["approved"] = all_approved
-
-        # Step 3: 3개 AI에게 최종 응답 생성 요청
-        print("\n📝 최종 응답 생성 중...")
+        result["pipeline"]["policy"] = "completed"
+        result["pipeline"]["execute"] = "completed"
+        self._check_cancelled(session_context)
         result["ai_responses"] = await self._generate_final_response(
             user_message, execution_results, vote_summaries
         )
-
-        # Step 4: 메모리에 기록
-        memory_entry = (
-            f"에이전트 명령: {user_message}\n"
-            f"실행 결과: {'성공' if all_approved else '거부'}\n"
-            f"사용된 도구: {', '.join(s['tool'] for s in plan_result['plan'])}"
-        )
-        self.memory_manager.save_memory(memory_entry, category="agent_execution")
-
-        summary = f"{'✅ 작업 완료' if all_approved else '❌ 작업 거부'} ({len(result['steps'])}단계)"
-        result["summary"] = summary
-
-        print(f"\n{'='*60}")
-        print(f"🦀 에이전트 실행 완료: {summary}")
-        print(f"{'='*60}\n")
-
+        result["summary"] = f"agent work completed ({len(result['steps'])} steps)"
+        self._audit_log(session_context, user_message, result)
+        result["pipeline"]["audit"] = "completed"
         return result

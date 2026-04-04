@@ -1,450 +1,584 @@
-import { useState, useRef, useEffect } from 'react'
-import axios from 'axios'
-import ReactMarkdown from 'react-markdown'
-import './App.css'
+import { useEffect, useMemo, useRef, useState } from "react";
+import axios from "axios";
+import ReactMarkdown from "react-markdown";
+import "./App.css";
 
-const API_BASE_URL = 'http://localhost:8000'
+const API_BASE_URL = "http://localhost:8000";
+const SESSION_STORAGE_KEY = "multiclaw.session_id";
+const DEFAULT_SESSION_ID = "default";
 
 interface Message {
-  type: 'user' | 'ai' | 'system' | 'agent'
-  content: string
-  aiName?: string
-  timestamp: string
-  fileInfo?: any
-  voteResult?: VoteInfo
-  agentResult?: AgentStepResult
-}
-
-interface AIResponse {
-  ai_name: string
-  response: string
-  timestamp: string
+  type: "user" | "ai" | "system" | "agent";
+  content: string;
+  aiName?: string;
+  timestamp: string;
+  agentResult?: AgentStepResult;
 }
 
 interface Document {
-  name: string
-  display_name: string
-  uri: string
-  mime_type: string
-  upload_time: number
+  name: string;
+  display_name: string;
+  uri: string;
+  mime_type: string;
+  upload_time: number;
 }
 
 interface VoteInfo {
-  ai_name: string
-  vote: 'APPROVE' | 'REJECT'
-  reason: string
+  ai_name: string;
+  vote: "APPROVE" | "REJECT";
+  reason: string;
 }
 
 interface AgentStepResult {
-  step: number
-  tool: string
-  description: string
+  step: number;
+  tool: string;
+  description: string;
   vote: {
-    approved: boolean
-    approve_count: number
-    reject_count: number
-    total_voters: number
-    votes: VoteInfo[]
-    summary: string
-  }
-  result: any
+    approved: boolean;
+    approve_count: number;
+    reject_count: number;
+    total_voters: number;
+    votes: VoteInfo[];
+    summary: string;
+  };
+  result: Record<string, unknown>;
 }
 
 interface AgentResult {
-  plan: any
-  steps: AgentStepResult[]
-  ai_responses: Record<string, string>
-  approved: boolean
-  summary: string
+  session_id?: string;
+  plan: unknown;
+  steps: AgentStepResult[];
+  ai_responses: Record<string, string>;
+  approved: boolean;
+  summary: string;
+  pipeline?: Record<string, string>;
+}
+
+interface HistoryResponse {
+  success: boolean;
+  session_id: string;
+  history: Array<{
+    type: "user" | "ai" | "system" | "agent";
+    message: string;
+    ai_name?: string;
+    timestamp: string;
+  }>;
+}
+
+function toSessionId(value: string): string {
+  const normalized = value.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "");
+  return normalized || DEFAULT_SESSION_ID;
+}
+
+function formatTimestamp(value: string): string {
+  return new Date(value).toLocaleTimeString("ko-KR");
 }
 
 function App() {
-  const [messages, setMessages] = useState<Message[]>([])
-  const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [uploadProgress, setUploadProgress] = useState<string>('')
-  const [showDocuments, setShowDocuments] = useState(false)
-  const [showMemory, setShowMemory] = useState(false)
-  const [documents, setDocuments] = useState<Document[]>([])
-  const [memoryContent, setMemoryContent] = useState<string>('')
-  const [agentMode, setAgentMode] = useState(false)
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [uploadProgress, setUploadProgress] = useState("");
+  const [showDocuments, setShowDocuments] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
+  const [documents, setDocuments] = useState<Document[]>([]);
+  const [memoryContent, setMemoryContent] = useState("");
+  const [agentMode, setAgentMode] = useState(false);
+  const [sessionId, setSessionId] = useState(() => {
+    const saved = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    return toSessionId(saved || DEFAULT_SESSION_ID);
+  });
+  const [sessionInput, setSessionInput] = useState(sessionId);
   const [voteResults, setVoteResults] = useState<Record<string, VoteInfo | null>>({
-    GPT: null, Claude: null, Gemini: null
-  })
+    GPT: null,
+    Claude: null,
+    Gemini: null,
+  });
   const [agentExecution, setAgentExecution] = useState<{
-    status: 'idle' | 'planning' | 'voting' | 'executing' | 'done'
-    output: string
-  }>({ status: 'idle', output: '' })
+    status: "idle" | "planning" | "voting" | "executing" | "done";
+    output: string;
+  }>({ status: "idle", output: "" });
 
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const requestAbortRef = useRef<AbortController | null>(null);
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }
+  const latestResponses = useMemo(() => {
+    const map: Record<string, Message | undefined> = {};
+    for (const aiName of ["GPT", "Claude", "Gemini"]) {
+      map[aiName] = [...messages]
+        .reverse()
+        .find((message) => message.type === "ai" && message.aiName === aiName);
+    }
+    return map;
+  }, [messages]);
 
   useEffect(() => {
-    scrollToBottom()
-  }, [messages])
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
-  // 에이전트 명령 감지
-  const isAgentCommand = (msg: string) => msg.trim().startsWith('/agent ')
+  useEffect(() => {
+    window.localStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+    setSessionInput(sessionId);
+  }, [sessionId]);
 
-  // 메시지 전송 (파일 업로드 포함)
+  useEffect(() => {
+    void loadHistory(sessionId);
+  }, [sessionId]);
+
+  const getAIImage = (aiName: string) => {
+    const imageMap: Record<string, string> = {
+      GPT: "/app/ai_image/ChatGPT_Image.png",
+      Claude: "/app/ai_image/Claude_Image.png",
+      Gemini: "/app/ai_image/Gemini_Image.png",
+    };
+    return imageMap[aiName] || "";
+  };
+
+  const getAIColor = (aiName: string) => {
+    const colorMap: Record<string, string> = {
+      GPT: "#10a37f",
+      Claude: "#cc785c",
+      Gemini: "#4285f4",
+    };
+    return colorMap[aiName] || "#666";
+  };
+
+  const appendMessage = (message: Message) => {
+    setMessages((current) => [...current, message]);
+  };
+
+  const loadHistory = async (targetSessionId: string) => {
+    try {
+      const response = await axios.get<HistoryResponse>(`${API_BASE_URL}/api/history`, {
+        params: { session_id: targetSessionId },
+      });
+      const restoredMessages: Message[] = (response.data.history || []).map((entry) => ({
+        type: entry.type,
+        content: entry.message,
+        aiName: entry.ai_name,
+        timestamp: entry.timestamp,
+      }));
+      setMessages(restoredMessages);
+      setVoteResults({ GPT: null, Claude: null, Gemini: null });
+      setAgentExecution({ status: "idle", output: "" });
+      setAgentMode(false);
+    } catch (error) {
+      console.error("Load history error:", error);
+      setMessages([]);
+    }
+  };
+
+  const handleApplySession = async () => {
+    const nextSessionId = toSessionId(sessionInput);
+    if (nextSessionId === sessionId) {
+      await loadHistory(nextSessionId);
+      return;
+    }
+    setSessionId(nextSessionId);
+  };
+
+  const handleResetSession = async () => {
+    const nextSessionId = DEFAULT_SESSION_ID;
+    setSessionInput(nextSessionId);
+    if (nextSessionId === sessionId) {
+      await loadHistory(nextSessionId);
+      return;
+    }
+    setSessionId(nextSessionId);
+  };
+
   const handleSend = async () => {
-    if (!input.trim() && !selectedFile) return
+    if (!input.trim() && !selectedFile) {
+      return;
+    }
 
-    const userMessage = input.trim()
-    const fileToUpload = selectedFile
+    const userMessage = input.trim();
+    const fileToUpload = selectedFile;
 
-    setInput('')
-    setSelectedFile(null)
-    setLoading(true)
+    setInput("");
+    setSelectedFile(null);
+    setLoading(true);
 
-    // 파일이 있으면 먼저 업로드
     if (fileToUpload) {
       try {
-        setUploadProgress('파일 업로드 중...')
-        const formData = new FormData()
-        formData.append('file', fileToUpload)
+        setUploadProgress("Uploading file...");
+        const formData = new FormData();
+        formData.append("file", fileToUpload);
 
         await axios.post(`${API_BASE_URL}/api/upload`, formData, {
-          headers: { 'Content-Type': 'multipart/form-data' }
-        })
+          params: { session_id: sessionId },
+          headers: { "Content-Type": "multipart/form-data" },
+        });
 
-        setMessages(prev => [...prev, {
-          type: 'system',
-          content: `📎 파일 업로드 완료: ${fileToUpload.name}`,
-          timestamp: new Date().toISOString()
-        }])
-
-        setUploadProgress('')
-      } catch (error: any) {
-        console.error('Upload error:', error)
-        setMessages(prev => [...prev, {
-          type: 'system',
-          content: `❌ 파일 업로드 실패: ${error.response?.data?.detail || error.message}`,
-          timestamp: new Date().toISOString()
-        }])
-        setUploadProgress('')
-        setLoading(false)
-        return
+        appendMessage({
+          type: "system",
+          content: `File uploaded: ${fileToUpload.name}`,
+          timestamp: new Date().toISOString(),
+        });
+        setUploadProgress("");
+      } catch (error: unknown) {
+        console.error("Upload error:", error);
+        const detail = axios.isAxiosError(error)
+          ? error.response?.data?.detail || error.message
+          : "Unknown error";
+        appendMessage({
+          type: "system",
+          content: `File upload failed: ${detail}`,
+          timestamp: new Date().toISOString(),
+        });
+        setUploadProgress("");
+        setLoading(false);
+        return;
       }
     }
 
     if (!userMessage) {
-      setLoading(false)
-      return
+      setLoading(false);
+      return;
     }
 
-    // 사용자 메시지 추가
-    const newUserMessage: Message = {
-      type: 'user',
+    appendMessage({
+      type: "user",
       content: userMessage,
-      timestamp: new Date().toISOString()
-    }
-    setMessages(prev => [...prev, newUserMessage])
+      timestamp: new Date().toISOString(),
+    });
 
-    // 에이전트 명령 처리
-    if (isAgentCommand(userMessage)) {
-      await handleAgentCommand(userMessage)
-    } else {
-      await handleChatMessage(userMessage)
-    }
+    await handleConversation(userMessage);
 
-    setLoading(false)
-  }
+    setLoading(false);
+  };
 
-  // 일반 채팅 처리
-  const handleChatMessage = async (userMessage: string) => {
+  const handleCancel = async () => {
+    requestAbortRef.current?.abort();
+    requestAbortRef.current = null;
+
     try {
-      setAgentMode(false)
-      setVoteResults({ GPT: null, Claude: null, Gemini: null })
-
-      const response = await axios.post(`${API_BASE_URL}/api/chat`, {
-        message: userMessage,
-        include_context: true
-      })
-
-      response.data.responses.forEach((aiResp: AIResponse) => {
-        setMessages(prev => [...prev, {
-          type: 'ai',
-          content: aiResp.response,
-          aiName: aiResp.ai_name,
-          timestamp: aiResp.timestamp
-        }])
-      })
-
-    } catch (error: any) {
-      console.error('Chat error:', error)
-      setMessages(prev => [...prev, {
-        type: 'system',
-        content: `❌ 오류: ${error.response?.data?.detail || error.message}`,
-        timestamp: new Date().toISOString()
-      }])
+      await axios.post(`${API_BASE_URL}/api/chat/cancel`, null, {
+        params: { session_id: sessionId },
+      });
+    } catch (error) {
+      console.error("Cancel request error:", error);
     }
-  }
 
-  // 에이전트 명령 처리
-  const handleAgentCommand = async (userMessage: string) => {
+    setLoading(false);
+    setAgentExecution({
+      status: "done",
+      output: "Execution stopped by user.",
+    });
+    appendMessage({
+      type: "system",
+      content: `Conversation cancelled in session "${sessionId}".`,
+      timestamp: new Date().toISOString(),
+    });
+  };
+
+  const handleConversation = async (userMessage: string) => {
     try {
-      setAgentMode(true)
-      setVoteResults({ GPT: null, Claude: null, Gemini: null })
-      setAgentExecution({ status: 'planning', output: '' })
+      setAgentMode(true);
+      setVoteResults({ GPT: null, Claude: null, Gemini: null });
+      setAgentExecution({ status: "planning", output: "" });
 
-      // 에이전트 시작 메시지
-      setMessages(prev => [...prev, {
-        type: 'system',
-        content: '🦀 멀티클로 에이전트 실행 중... 3개 AI가 투표 진행합니다.',
-        timestamp: new Date().toISOString()
-      }])
+      appendMessage({
+        type: "system",
+        content: `Agent orchestration active in session "${sessionId}".`,
+        timestamp: new Date().toISOString(),
+      });
 
-      setAgentExecution({ status: 'voting', output: '' })
+      const abortController = new AbortController();
+      requestAbortRef.current = abortController;
+      const response = await axios.post(
+        `${API_BASE_URL}/api/chat`,
+        {
+          message: userMessage,
+          include_context: true,
+          session_id: sessionId,
+        },
+        {
+          signal: abortController.signal,
+        }
+      );
+      requestAbortRef.current = null;
 
-      const response = await axios.post(`${API_BASE_URL}/api/agent`, {
-        message: userMessage,
-      })
-
-      const agentResult: AgentResult = response.data.agent_result
-
-      // 투표 결과 업데이트
-      const newVoteResults: Record<string, VoteInfo | null> = {
-        GPT: null, Claude: null, Gemini: null
+      const agentResult: AgentResult = response.data.agent_result;
+      const pipeline = agentResult.pipeline || {};
+      if (pipeline.execute === "completed") {
+        setAgentExecution((current) => ({ ...current, status: "executing" }));
+      } else {
+        setAgentExecution({ status: "voting", output: "" });
       }
 
-      if (agentResult.steps && agentResult.steps.length > 0) {
-        // 모든 단계의 투표 결과를 합산
-        agentResult.steps.forEach(step => {
-          if (step.vote && step.vote.votes) {
-            step.vote.votes.forEach(vote => {
-              newVoteResults[vote.ai_name] = vote
-            })
-          }
-        })
-      }
+      const nextVotes: Record<string, VoteInfo | null> = {
+        GPT: null,
+        Claude: null,
+        Gemini: null,
+      };
 
-      setVoteResults(newVoteResults)
+      (agentResult.steps || []).forEach((step) => {
+        (step.vote?.votes || []).forEach((vote) => {
+          nextVotes[vote.ai_name] = vote;
+        });
+      });
+      setVoteResults(nextVotes);
 
-      // 에이전트 실행 결과 표시
       if (agentResult.steps && agentResult.steps.length > 0) {
         setAgentExecution({
-          status: 'done',
-          output: agentResult.steps.map(step => {
-            const voteEmoji = step.vote.approved ? '✅' : '❌'
-            let output = `[단계 ${step.step}] ${step.description}\n`
-            output += `투표: ${voteEmoji} ${step.vote.summary}\n`
-            if (step.result) {
-              if (step.result.stdout) output += `출력:\n${step.result.stdout}\n`
-              if (step.result.content) output += `내용:\n${step.result.content.substring(0, 500)}\n`
-              if (step.result.entries) output += `파일 목록:\n${step.result.entries.map((e: any) => `  ${e.type === 'directory' ? '📁' : '📄'} ${e.name}`).join('\n')}\n`
-              if (step.result.error) output += `오류: ${step.result.error}\n`
-            }
-            return output
-          }).join('\n---\n')
-        })
+          status: "done",
+          output: agentResult.steps
+            .map((step) => {
+              const lines = [
+                `[Step ${step.step}] ${step.description}`,
+                `Vote: ${step.vote.summary}`,
+              ];
+              if (step.result?.stdout) {
+                lines.push(`Output:\n${String(step.result.stdout)}`);
+              }
+              if (step.result?.content) {
+                lines.push(`Content:\n${String(step.result.content).slice(0, 500)}`);
+              }
+              if (Array.isArray(step.result?.entries)) {
+                lines.push(
+                  `Files:\n${step.result.entries
+                    .map((entry: { type: string; name: string }) =>
+                      `  ${entry.type === "directory" ? "[dir]" : "[file]"} ${entry.name}`
+                    )
+                    .join("\n")}`
+                );
+              }
+              if (step.result?.error) {
+                lines.push(`Error: ${String(step.result.error)}`);
+              }
+              return lines.join("\n");
+            })
+            .join("\n---\n"),
+        });
 
-        // 투표 결과 메시지
-        agentResult.steps.forEach(step => {
-          setMessages(prev => [...prev, {
-            type: 'agent',
-            content: `🗳️ **[${step.description}]** ${step.vote.summary}`,
+        agentResult.steps.forEach((step) => {
+          appendMessage({
+            type: "agent",
+            content: `**${step.description}**\n\n${step.vote.summary}`,
             timestamp: new Date().toISOString(),
-            agentResult: step
-          }])
-        })
+            agentResult: step,
+          });
+        });
       } else {
-        setAgentExecution({ status: 'done', output: '도구 사용 없이 응답 생성' })
+        setAgentExecution({ status: "done", output: "No tool steps were needed." });
       }
 
-      // AI 응답 추가
-      Object.entries(agentResult.ai_responses || {}).forEach(([aiName, resp]) => {
-        setMessages(prev => [...prev, {
-          type: 'ai',
-          content: resp as string,
-          aiName: aiName,
-          timestamp: new Date().toISOString()
-        }])
-      })
-
-    } catch (error: any) {
-      console.error('Agent error:', error)
-      setAgentExecution({ status: 'idle', output: '' })
-      setMessages(prev => [...prev, {
-        type: 'system',
-        content: `❌ 에이전트 오류: ${error.response?.data?.detail || error.message}`,
-        timestamp: new Date().toISOString()
-      }])
+      Object.entries(agentResult.ai_responses || {}).forEach(([aiName, content]) => {
+        appendMessage({
+          type: "ai",
+          content,
+          aiName,
+          timestamp: new Date().toISOString(),
+        });
+      });
+    } catch (error: unknown) {
+      requestAbortRef.current = null;
+      console.error("Conversation error:", error);
+      if (
+        axios.isCancel(error) ||
+        (error instanceof Error && error.name === "CanceledError")
+      ) {
+        return;
+      }
+      setAgentExecution({ status: "idle", output: "" });
+      const detail = axios.isAxiosError(error)
+        ? error.response?.data?.detail || error.message
+        : "Unknown error";
+      appendMessage({
+        type: "system",
+        content: `Conversation failed: ${detail}`,
+        timestamp: new Date().toISOString(),
+      });
     }
-  }
+  };
 
-  // 히스토리 초기화
   const handleClearHistory = async () => {
-    if (!confirm('대화 기록을 모두 삭제하시겠습니까?')) return
+    if (!window.confirm(`Clear chat history for session "${sessionId}"?`)) {
+      return;
+    }
 
     try {
-      await axios.delete(`${API_BASE_URL}/api/history`)
-      setMessages([])
-      setAgentMode(false)
-      setVoteResults({ GPT: null, Claude: null, Gemini: null })
-      setAgentExecution({ status: 'idle', output: '' })
+      await axios.delete(`${API_BASE_URL}/api/history`, {
+        params: { session_id: sessionId },
+      });
+      setMessages([]);
+      setAgentMode(false);
+      setVoteResults({ GPT: null, Claude: null, Gemini: null });
+      setAgentExecution({ status: "idle", output: "" });
     } catch (error) {
-      console.error('Clear history error:', error)
+      console.error("Clear history error:", error);
     }
-  }
+  };
 
-  // 문서 목록 불러오기
   const loadDocuments = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/documents`)
+      const response = await axios.get(`${API_BASE_URL}/api/documents`);
       if (response.data.success) {
-        setDocuments(response.data.documents)
+        setDocuments(response.data.documents);
       }
     } catch (error) {
-      console.error('Load documents error:', error)
+      console.error("Load documents error:", error);
     }
-  }
+  };
 
-  // 문서 삭제
   const handleDeleteDocument = async (documentId: string) => {
-    if (!confirm('이 문서를 삭제하시겠습니까?')) return
+    if (!window.confirm("Delete this uploaded document?")) {
+      return;
+    }
 
     try {
-      await axios.delete(`${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}`)
-      setMessages(prev => [...prev, {
-        type: 'system',
-        content: `🗑️ 문서 삭제 완료`,
-        timestamp: new Date().toISOString()
-      }])
-      loadDocuments()
-    } catch (error: any) {
-      console.error('Delete document error:', error)
-      alert(`문서 삭제 실패: ${error.response?.data?.error || error.message}`)
+      await axios.delete(`${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}`);
+      appendMessage({
+        type: "system",
+        content: "Document deleted.",
+        timestamp: new Date().toISOString(),
+      });
+      await loadDocuments();
+    } catch (error: unknown) {
+      console.error("Delete document error:", error);
+      const detail = axios.isAxiosError(error)
+        ? error.response?.data?.error || error.message
+        : "Unknown error";
+      window.alert(`Delete failed: ${detail}`);
     }
-  }
+  };
 
-  // 모든 문서 삭제
   const handleClearAllDocuments = async () => {
-    if (!confirm('모든 문서를 삭제하시겠습니까?\n이 작업은 되돌릴 수 없습니다.')) return
+    if (!window.confirm("Delete all uploaded documents? This cannot be undone.")) {
+      return;
+    }
 
     try {
-      const response = await axios.delete(`${API_BASE_URL}/api/documents`)
-      setMessages(prev => [...prev, {
-        type: 'system',
-        content: `🗑️ ${response.data.message}`,
-        timestamp: new Date().toISOString()
-      }])
-      loadDocuments()
-    } catch (error: any) {
-      console.error('Clear all documents error:', error)
-      alert(`문서 삭제 실패: ${error.response?.data?.error || error.message}`)
+      const response = await axios.delete(`${API_BASE_URL}/api/documents`);
+      appendMessage({
+        type: "system",
+        content: response.data.message || "All documents deleted.",
+        timestamp: new Date().toISOString(),
+      });
+      await loadDocuments();
+    } catch (error: unknown) {
+      console.error("Clear all documents error:", error);
+      const detail = axios.isAxiosError(error)
+        ? error.response?.data?.error || error.message
+        : "Unknown error";
+      window.alert(`Delete failed: ${detail}`);
     }
-  }
+  };
 
-  // 문서 관리 모달 열기
-  const handleOpenDocuments = () => {
-    loadDocuments()
-    setShowDocuments(true)
-  }
+  const handleOpenDocuments = async () => {
+    await loadDocuments();
+    setShowDocuments(true);
+  };
 
-  // 메모리 조회
   const handleOpenMemory = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/api/memory`)
-      setMemoryContent(response.data.content || '메모리가 비어있습니다.')
-      setShowMemory(true)
+      const response = await axios.get(`${API_BASE_URL}/api/memory`, {
+        params: { session_id: sessionId },
+      });
+      setMemoryContent(response.data.content || "Memory is empty.");
+      setShowMemory(true);
     } catch (error) {
-      console.error('Load memory error:', error)
-      setMemoryContent('메모리를 불러올 수 없습니다.')
-      setShowMemory(true)
+      console.error("Load memory error:", error);
+      setMemoryContent("Could not load memory.");
+      setShowMemory(true);
     }
-  }
+  };
 
-  // 메모리 초기화
   const handleClearMemory = async () => {
-    if (!confirm('장기 메모리를 모두 삭제하시겠습니까?')) return
+    if (!window.confirm(`Clear memory for session "${sessionId}"?`)) {
+      return;
+    }
 
     try {
-      await axios.delete(`${API_BASE_URL}/api/memory`)
-      setMemoryContent('메모리가 초기화되었습니다.')
+      await axios.delete(`${API_BASE_URL}/api/memory`, {
+        params: { session_id: sessionId },
+      });
+      setMemoryContent("Memory cleared.");
     } catch (error) {
-      console.error('Clear memory error:', error)
+      console.error("Clear memory error:", error);
     }
-  }
-
-  // AI 이미지 매핑
-  const getAIImage = (aiName: string) => {
-    const imageMap: Record<string, string> = {
-      'GPT': '/app/ai_image/ChatGPT_Image.png',
-      'Claude': '/app/ai_image/Claude_Image.png',
-      'Gemini': '/app/ai_image/Gemini_Image.png'
-    }
-    return imageMap[aiName] || ''
-  }
-
-  // AI 색상 매핑
-  const getAIColor = (aiName: string) => {
-    const colorMap: Record<string, string> = {
-      'GPT': '#10a37f',
-      'Claude': '#cc785c',
-      'Gemini': '#4285f4'
-    }
-    return colorMap[aiName] || '#666'
-  }
+  };
 
   return (
     <div className="app-container">
-      {/* 헤더 */}
       <header className="header multiclaw-header">
-        <h1>🦀 멀티클로 MultiClaw</h1>
-        <div className="header-subtitle">AI 다수결 투표 에이전트</div>
+        <div className="header-title-group">
+          <h1>MultiClaw</h1>
+          <div className="header-subtitle">Multi-AI voting agent</div>
+        </div>
+        <div className="session-toolbar">
+          <label className="session-label" htmlFor="session-id-input">
+            Session
+          </label>
+          <input
+            id="session-id-input"
+            value={sessionInput}
+            onChange={(event) => setSessionInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !loading) {
+                void handleApplySession();
+              }
+            }}
+            className="session-input"
+            placeholder="default"
+            disabled={loading}
+          />
+          <button onClick={() => void handleApplySession()} className="session-btn" disabled={loading}>
+            Switch
+          </button>
+          <button onClick={() => void handleResetSession()} className="session-btn session-btn-secondary" disabled={loading}>
+            Reset
+          </button>
+          <span className="session-active">Active: {sessionId}</span>
+        </div>
         <div className="header-buttons">
-          <button onClick={handleOpenMemory} className="memory-btn">
-            🧠 메모리
+          <button onClick={() => void handleOpenMemory()} className="memory-btn">
+            Memory
           </button>
-          <button onClick={handleOpenDocuments} className="docs-btn">
-            📚 문서 관리
+          <button onClick={() => void handleOpenDocuments()} className="docs-btn">
+            Documents
           </button>
-          <button onClick={handleClearHistory} className="clear-btn">
-            🗑️ 대화 초기화
+          <button onClick={() => void handleClearHistory()} className="clear-btn">
+            Clear Chat
           </button>
         </div>
       </header>
 
-      {/* 문서 관리 모달 */}
       {showDocuments && (
         <div className="modal-overlay" onClick={() => setShowDocuments(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-content" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
-              <h2>📚 업로드된 문서</h2>
-              <button onClick={() => setShowDocuments(false)} className="modal-close">❌</button>
+              <h2>Uploaded Documents</h2>
+              <button onClick={() => setShowDocuments(false)} className="modal-close">
+                X
+              </button>
             </div>
             <div className="modal-body">
               {documents.length === 0 ? (
-                <p className="no-documents">업로드된 문서가 없습니다.</p>
+                <p className="no-documents">No uploaded documents yet.</p>
               ) : (
                 <>
                   <div className="documents-list">
-                    {documents.map((doc, idx) => (
-                      <div key={idx} className="document-item">
+                    {documents.map((doc) => (
+                      <div key={doc.name} className="document-item">
                         <div className="document-info">
-                          <div className="document-name">📄 {doc.display_name}</div>
+                          <div className="document-name">{doc.display_name}</div>
                           <div className="document-meta">
-                            {doc.mime_type} • {new Date(doc.upload_time * 1000).toLocaleString('ko-KR')}
+                            {doc.mime_type} · {new Date(doc.upload_time * 1000).toLocaleString("ko-KR")}
                           </div>
                         </div>
-                        <button
-                          onClick={() => handleDeleteDocument(doc.name)}
-                          className="delete-doc-btn"
-                        >
-                          🗑️ 삭제
+                        <button onClick={() => void handleDeleteDocument(doc.name)} className="delete-doc-btn">
+                          Delete
                         </button>
                       </div>
                     ))}
                   </div>
                   <div className="modal-footer">
-                    <button onClick={handleClearAllDocuments} className="clear-all-btn">
-                      🗑️ 모든 문서 삭제
+                    <button onClick={() => void handleClearAllDocuments()} className="clear-all-btn">
+                      Delete All
                     </button>
                   </div>
                 </>
@@ -454,22 +588,24 @@ function App() {
         </div>
       )}
 
-      {/* 메모리 모달 */}
       {showMemory && (
         <div className="modal-overlay" onClick={() => setShowMemory(false)}>
-          <div className="modal-content memory-modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal-content memory-modal" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
-              <h2>🧠 장기 메모리</h2>
-              <button onClick={() => setShowMemory(false)} className="modal-close">❌</button>
+              <h2>Session Memory</h2>
+              <button onClick={() => setShowMemory(false)} className="modal-close">
+                X
+              </button>
             </div>
             <div className="modal-body">
+              <div className="memory-session-note">Session: {sessionId}</div>
               <div className="memory-content">
                 <ReactMarkdown>{memoryContent}</ReactMarkdown>
               </div>
             </div>
             <div className="modal-footer">
-              <button onClick={handleClearMemory} className="clear-all-btn">
-                🗑️ 메모리 초기화
+              <button onClick={() => void handleClearMemory()} className="clear-all-btn">
+                Clear Memory
               </button>
             </div>
           </div>
@@ -477,15 +613,10 @@ function App() {
       )}
 
       <div className="main-content">
-        {/* 왼쪽: AI 응답 패널들 */}
         <div className="ai-panels">
-          {['GPT', 'Claude', 'Gemini'].map(aiName => {
-            const latestResponse = [...messages]
-              .reverse()
-              .find(m => m.type === 'ai' && m.aiName === aiName)
-
-            const vote = voteResults[aiName]
-
+          {["GPT", "Claude", "Gemini"].map((aiName) => {
+            const latestResponse = latestResponses[aiName];
+            const vote = voteResults[aiName];
             return (
               <div key={aiName} className="ai-panel" style={{ borderColor: getAIColor(aiName) }}>
                 <div className="ai-header">
@@ -493,104 +624,88 @@ function App() {
                   <div className="ai-name-tag">
                     <h3 style={{ color: getAIColor(aiName) }}>{aiName}</h3>
                   </div>
-                  {/* 투표 배지 */}
                   {vote && (
-                    <div className={`vote-badge ${vote.vote === 'APPROVE' ? 'vote-approve' : 'vote-reject'}`}>
-                      {vote.vote === 'APPROVE' ? '✅ 승인' : '❌ 거부'}
+                    <div className={`vote-badge ${vote.vote === "APPROVE" ? "vote-approve" : "vote-reject"}`}>
+                      {vote.vote}
                     </div>
                   )}
-                  {agentMode && !vote && loading && (
-                    <div className="vote-badge vote-pending">
-                      🗳️ 투표 중...
-                    </div>
-                  )}
+                  {agentMode && !vote && loading && <div className="vote-badge vote-pending">Voting...</div>}
                 </div>
                 <div className="ai-response">
-                  {/* 투표 이유 표시 */}
                   {vote && (
-                    <div className={`vote-reason ${vote.vote === 'APPROVE' ? 'vote-reason-approve' : 'vote-reason-reject'}`}>
-                      <strong>투표 이유:</strong> {vote.reason}
+                    <div className={`vote-reason ${vote.vote === "APPROVE" ? "vote-reason-approve" : "vote-reason-reject"}`}>
+                      <strong>Reason:</strong> {vote.reason}
                     </div>
                   )}
                   {latestResponse ? (
                     <ReactMarkdown>{latestResponse.content}</ReactMarkdown>
                   ) : (
-                    <p className="placeholder">대기 중...</p>
+                    <p className="placeholder">Waiting for response...</p>
                   )}
                 </div>
               </div>
-            )
+            );
           })}
         </div>
 
-        {/* 오른쪽: 대화 히스토리 + 에이전트 결과 */}
         <div className="right-panel">
-          {/* 에이전트 실행 결과 */}
-          {agentMode && agentExecution.status !== 'idle' && (
+          {agentMode && agentExecution.status !== "idle" && (
             <div className="agent-result-panel">
-              <h3>🦀 에이전트 실행</h3>
+              <h3>Agent Execution</h3>
               <div className="agent-status">
-                {agentExecution.status === 'planning' && '📋 작업 계획 생성 중...'}
-                {agentExecution.status === 'voting' && '🗳️ AI 투표 진행 중...'}
-                {agentExecution.status === 'executing' && '⚡ 작업 실행 중...'}
-                {agentExecution.status === 'done' && '✅ 실행 완료'}
+                {agentExecution.status === "planning" && "Creating plan..."}
+                {agentExecution.status === "voting" && "Collecting votes..."}
+                {agentExecution.status === "executing" && "Executing tools..."}
+                {agentExecution.status === "done" && "Execution completed"}
               </div>
-              {agentExecution.output && (
-                <pre className="agent-output">{agentExecution.output}</pre>
-              )}
+              {agentExecution.output && <pre className="agent-output">{agentExecution.output}</pre>}
             </div>
           )}
 
-          {/* 대화 히스토리 */}
           <div className="chat-history">
-            <h3>💬 대화 히스토리</h3>
+            <div className="chat-history-header">
+              <h3>Chat History</h3>
+              <span className="chat-history-session">{sessionId}</span>
+            </div>
             <div className="history-messages">
               {messages.map((msg, idx) => (
-                <div key={idx} className={`history-message ${msg.type}`}>
-                  {msg.type === 'user' && (
+                <div key={`${msg.timestamp}-${idx}`} className={`history-message ${msg.type}`}>
+                  {msg.type === "user" && (
                     <div className="user-message">
                       <div className="message-header">
-                        <span className="sender-badge user-badge">👤 You</span>
-                        <span className="timestamp">
-                          {new Date(msg.timestamp).toLocaleTimeString('ko-KR')}
-                        </span>
+                        <span className="sender-badge user-badge">You</span>
+                        <span className="timestamp">{formatTimestamp(msg.timestamp)}</span>
                       </div>
                       <div className="message-content">{msg.content}</div>
                     </div>
                   )}
-                  {msg.type === 'ai' && (
-                    <div className="ai-message" style={{ borderLeftColor: getAIColor(msg.aiName!) }}>
+                  {msg.type === "ai" && (
+                    <div className="ai-message" style={{ borderLeftColor: getAIColor(msg.aiName || "") }}>
                       <div className="message-header">
-                        <span className="sender-badge ai-badge" style={{ backgroundColor: getAIColor(msg.aiName!) }}>
-                          🤖 {msg.aiName}
+                        <span className="sender-badge ai-badge" style={{ backgroundColor: getAIColor(msg.aiName || "") }}>
+                          {msg.aiName}
                         </span>
-                        <span className="timestamp">
-                          {new Date(msg.timestamp).toLocaleTimeString('ko-KR')}
-                        </span>
+                        <span className="timestamp">{formatTimestamp(msg.timestamp)}</span>
                       </div>
                       <div className="message-content">
                         <ReactMarkdown>{msg.content}</ReactMarkdown>
                       </div>
                     </div>
                   )}
-                  {msg.type === 'system' && (
+                  {msg.type === "system" && (
                     <div className="system-message">
                       <div className="message-header">
-                        <span className="sender-badge system-badge">⚙️ System</span>
-                        <span className="timestamp">
-                          {new Date(msg.timestamp).toLocaleTimeString('ko-KR')}
-                        </span>
+                        <span className="sender-badge system-badge">System</span>
+                        <span className="timestamp">{formatTimestamp(msg.timestamp)}</span>
                       </div>
                       <div className="message-content">{msg.content}</div>
                     </div>
                   )}
-                  {msg.type === 'agent' && (
+                  {msg.type === "agent" && (
                     <div className="agent-message">
                       <div className="message-header">
-                        <span className="sender-badge agent-badge">🦀 Agent</span>
-                        <span className="timestamp">
-                          {new Date(msg.timestamp).toLocaleTimeString('ko-KR')}
-                        </span>
+                        <span className="sender-badge agent-badge">Agent</span>
+                        <span className="timestamp">{formatTimestamp(msg.timestamp)}</span>
                       </div>
                       <div className="message-content">
                         <ReactMarkdown>{msg.content}</ReactMarkdown>
@@ -605,30 +720,31 @@ function App() {
         </div>
       </div>
 
-      {/* 입력 영역 */}
       <div className="input-area">
         <div className="input-container">
           <input
             type="file"
             ref={fileInputRef}
-            onChange={(e) => setSelectedFile(e.target.files?.[0] || null)}
+            onChange={(event) => setSelectedFile(event.target.files?.[0] || null)}
             accept=".pdf,.docx,.txt,.json,.png,.jpg,.jpeg"
-            style={{ display: 'none' }}
+            style={{ display: "none" }}
           />
 
           <button
             onClick={() => fileInputRef.current?.click()}
             className="file-btn"
-            title="파일 첨부 (전송 시 업로드)"
+            title="Select a file to upload before sending"
             disabled={loading}
           >
-            📎
+            File
           </button>
 
           {selectedFile && (
             <span className="file-preview">
-              📄 {selectedFile.name}
-              <button onClick={() => setSelectedFile(null)} className="file-remove">❌</button>
+              {selectedFile.name}
+              <button onClick={() => setSelectedFile(null)} className="file-remove">
+                X
+              </button>
             </span>
           )}
 
@@ -637,28 +753,39 @@ function App() {
           <input
             type="text"
             value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyPress={(e) => e.key === 'Enter' && !loading && handleSend()}
-            placeholder="/agent 파일 목록 보여줘  |  일반 대화도 가능합니다  |  @GPT @Claude @Gemini AI 지명"
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !loading) {
+                void handleSend();
+              }
+            }}
+            placeholder='Ask anything. MultiClaw will decide whether to read files, write files, run commands, or just answer.'
             disabled={loading}
             className="message-input"
           />
 
           <button
-            onClick={handleSend}
+            onClick={() => void handleSend()}
             disabled={loading || (!input.trim() && !selectedFile)}
             className="send-btn"
           >
-            {loading ? '⏳' : '📤'}
+            {loading ? "..." : "Send"}
+          </button>
+          <button
+            onClick={() => void handleCancel()}
+            disabled={!loading}
+            className="cancel-btn"
+          >
+            Stop
           </button>
         </div>
 
         <div className="input-hint">
-          🦀 <strong>/agent</strong> 명령으로 에이전트 실행 (3 AI 투표) | @GPT, @Claude, @Gemini로 AI 지명 | 📎 파일은 전송 시 업로드
+          Every message is agent-enabled by default. Each session keeps its own chat history, memory, votes, and audit trail.
         </div>
       </div>
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

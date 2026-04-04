@@ -1,5 +1,4 @@
 import type React from "react";
-import type { Message } from "@langchain/langgraph-sdk";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Loader2, Copy, CopyCheck } from "lucide-react";
 import { InputForm } from "@/components/InputForm";
@@ -12,6 +11,12 @@ import {
   ActivityTimeline,
   ProcessedEvent,
 } from "@/components/ActivityTimeline"; // Assuming ActivityTimeline is in the same dir or adjust path
+
+type Message = {
+  id?: string;
+  type: "human" | "ai" | string;
+  content: string | unknown;
+};
 
 // Markdown component props type from former ReportView
 type MdComponentProps = {
@@ -185,6 +190,10 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
   const activityForThisBubble =
     isLastMessage && isOverallLoading ? liveActivity : historicalActivity;
   const isLiveActivityForThisBubble = isLastMessage && isOverallLoading;
+  const messageText =
+    typeof message.content === "string"
+      ? message.content
+      : JSON.stringify(message.content);
 
   return (
     <div className={`relative break-words flex flex-col`}>
@@ -197,22 +206,15 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
         </div>
       )}
       <ReactMarkdown components={mdComponents}>
-        {typeof message.content === "string"
-          ? message.content
-          : JSON.stringify(message.content)}
+        {messageText}
       </ReactMarkdown>
       <Button
         variant="default"
         className={`cursor-pointer bg-neutral-700 border-neutral-600 text-neutral-300 self-end ${
-          message.content.length > 0 ? "visible" : "hidden"
+          messageText.length > 0 ? "visible" : "hidden"
         }`}
         onClick={() =>
-          handleCopy(
-            typeof message.content === "string"
-              ? message.content
-              : JSON.stringify(message.content),
-            message.id!
-          )
+          handleCopy(messageText, message.id!)
         }
       >
         {copiedMessageId === message.id ? "Copied" : "Copy"}

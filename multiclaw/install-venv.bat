@@ -17,20 +17,32 @@ if %errorlevel% neq 0 (
 echo Virtual environment created.
 
 echo.
-echo [2/3] Installing backend (with venv)...
+echo [2/4] Installing backend (with venv)...
 call .venv\Scripts\activate.bat
-pip install -e .
+python -m pip install -e .
 if %errorlevel% neq 0 (
     echo Backend installation failed!
     pause
     exit /b 1
 )
 echo Backend installation complete.
+
+echo.
+echo [3/4] Installing Playwright Chromium browser...
+python -m playwright install chromium
+if %errorlevel% neq 0 (
+    echo Playwright Chromium installation failed!
+    echo Try manually running: python -m playwright install chromium
+    pause
+    exit /b 1
+)
+echo Playwright Chromium installation complete.
+
 deactivate
 cd ..
 
 echo.
-echo [3/3] Installing frontend...
+echo [4/4] Installing frontend...
 cd frontend
 call npm install
 if %errorlevel% neq 0 (

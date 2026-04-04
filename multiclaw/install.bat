@@ -8,9 +8,9 @@ echo.
 
 cd /d "%~dp0"
 
-echo [1/2] Installing backend dependencies...
+echo [1/3] Installing backend dependencies...
 cd backend
-pip install --user -e .
+python -m pip install --user -e .
 if %errorlevel% neq 0 (
     echo ERROR: Backend installation failed
     echo.
@@ -21,9 +21,22 @@ if %errorlevel% neq 0 (
 echo Backend installation completed!
 echo.
 
+echo [2/3] Installing Playwright Chromium browser...
+python -m playwright install chromium
+if %errorlevel% neq 0 (
+    echo ERROR: Playwright Chromium installation failed
+    echo.
+    echo Try rerunning this installer or manually run:
+    echo   python -m playwright install chromium
+    pause
+    exit /b 1
+)
+echo Playwright Chromium installation completed!
+echo.
+
 cd ..
 
-echo [2/2] Installing frontend dependencies...
+echo [3/3] Installing frontend dependencies...
 cd frontend
 call npm install
 if %errorlevel% neq 0 (

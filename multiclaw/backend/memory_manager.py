@@ -1,229 +1,261 @@
 """
-MultiClaw Memory Manager - 로컬 장기 메모리 시스템
-OpenClaw 스타일의 로컬 파일 기반 장기 메모리
+Session-scoped memory manager for MultiClaw.
+
+The public API stays close to the original version, but the underlying
+storage is now isolated by session.
 """
 
+from __future__ import annotations
+
 import json
-import os
-from datetime import datetime, date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
+from runtime_config import RuntimeConfig, get_runtime_config
+from session_context import sanitize_session_id
+
+
+DEFAULT_SUMMARY_HEADER = (
+    "# MultiClaw Long-Term Memory\n\n"
+    "Important notes and preferences are stored here.\n\n"
+    "---\n\n"
+)
 
 
 class MemoryManager:
-    """로컬 장기 메모리 관리자"""
-
-    def __init__(self, base_dir: str = None):
+    def __init__(
+        self,
+        base_dir: str | None = None,
+        runtime_config: RuntimeConfig | None = None,
+    ):
+        self.runtime_config = runtime_config or get_runtime_config()
         if base_dir is None:
-            base_dir = os.path.join(os.path.dirname(__file__), "data", "memory")
+            self.base_dir = self.runtime_config.memory_root
+        else:
+            self.base_dir = Path(base_dir).resolve()
+        self.sessions_dir = self.base_dir / "sessions"
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata = self.get_session_metadata()
+        print("MemoryManager initialized")
 
-        self.base_dir = Path(base_dir)
-        self.daily_dir = self.base_dir / "daily"
-        self.memory_file = self.base_dir / "MEMORY.md"
-        self.metadata_file = self.base_dir / "metadata.json"
+    def _resolve_session_id(self, session_id: Optional[str] = None) -> str:
+        return sanitize_session_id(session_id, self.runtime_config.default_session_id)
 
-        # 디렉토리 생성
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.daily_dir.mkdir(parents=True, exist_ok=True)
+    def _session_dir(self, session_id: Optional[str] = None) -> Path:
+        session_dir = self.sessions_dir / self._resolve_session_id(session_id)
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir
 
-        # MEMORY.md 초기화
-        if not self.memory_file.exists():
-            self.memory_file.write_text(
-                "# MultiClaw 장기 메모리\n\n"
-                "이 파일은 중요한 대화 내용과 사용자 선호도를 기록합니다.\n\n"
-                "---\n\n",
-                encoding="utf-8",
-            )
+    def _daily_dir(self, session_id: Optional[str] = None) -> Path:
+        daily_dir = self._session_dir(session_id) / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+        return daily_dir
 
-        # 메타데이터 로드
-        self.metadata = self._load_metadata()
-        print("✅ MemoryManager 초기화 완료")
+    def _memory_file(self, session_id: Optional[str] = None) -> Path:
+        memory_file = self._session_dir(session_id) / "MEMORY.md"
+        if not memory_file.exists():
+            memory_file.write_text(DEFAULT_SUMMARY_HEADER, encoding="utf-8")
+        return memory_file
 
-    def _load_metadata(self) -> Dict[str, Any]:
-        if self.metadata_file.exists():
+    def _metadata_file(self, session_id: Optional[str] = None) -> Path:
+        return self._session_dir(session_id) / "metadata.json"
+
+    def _load_metadata(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        metadata_file = self._metadata_file(session_id)
+        if metadata_file.exists():
             try:
-                return json.loads(self.metadata_file.read_text(encoding="utf-8"))
+                return json.loads(metadata_file.read_text(encoding="utf-8"))
             except Exception:
                 pass
         return {"total_entries": 0, "last_updated": None, "categories": {}}
 
-    def _save_metadata(self):
-        self.metadata["last_updated"] = datetime.now().isoformat()
-        self.metadata_file.write_text(
-            json.dumps(self.metadata, ensure_ascii=False, indent=2),
+    def _save_metadata(self, metadata: Dict[str, Any], session_id: Optional[str] = None) -> None:
+        metadata["last_updated"] = datetime.now().isoformat()
+        self._metadata_file(session_id).write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        if self._resolve_session_id(session_id) == self.runtime_config.default_session_id:
+            self.metadata = metadata
 
-    def save_memory(self, content: str, category: str = "general") -> Dict[str, Any]:
-        """메모리 항목 저장"""
+    def get_session_metadata(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        return self._load_metadata(session_id)
+
+    def save_memory(
+        self,
+        content: str,
+        category: str = "general",
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         timestamp = datetime.now()
-
-        # 일별 로그에 저장
-        daily_file = self.daily_dir / f"{timestamp.strftime('%Y-%m-%d')}.md"
-
+        daily_file = self._daily_dir(session_id) / f"{timestamp.strftime('%Y-%m-%d')}.md"
         entry = f"\n## [{timestamp.strftime('%H:%M:%S')}] [{category}]\n{content}\n"
 
         if daily_file.exists():
-            existing = daily_file.read_text(encoding="utf-8")
-            daily_file.write_text(existing + entry, encoding="utf-8")
+            daily_file.write_text(
+                daily_file.read_text(encoding="utf-8") + entry,
+                encoding="utf-8",
+            )
         else:
-            header = f"# 대화 로그 - {timestamp.strftime('%Y년 %m월 %d일')}\n"
+            header = f"# Daily Log - {timestamp.strftime('%Y-%m-%d')}\n"
             daily_file.write_text(header + entry, encoding="utf-8")
 
-        # 메타데이터 업데이트
-        self.metadata["total_entries"] = self.metadata.get("total_entries", 0) + 1
-        cat_count = self.metadata.get("categories", {})
-        cat_count[category] = cat_count.get(category, 0) + 1
-        self.metadata["categories"] = cat_count
-        self._save_metadata()
+        metadata = self._load_metadata(session_id)
+        metadata["total_entries"] = metadata.get("total_entries", 0) + 1
+        categories = metadata.get("categories", {})
+        categories[category] = categories.get(category, 0) + 1
+        metadata["categories"] = categories
+        self._save_metadata(metadata, session_id)
 
         return {
             "success": True,
-            "message": "메모리 저장 완료",
+            "message": "memory saved",
+            "session_id": self._resolve_session_id(session_id),
             "date": timestamp.strftime("%Y-%m-%d"),
             "category": category,
         }
 
-    def update_summary(self, summary: str) -> Dict[str, Any]:
-        """MEMORY.md 핵심 요약 업데이트"""
+    def update_summary(self, summary: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        memory_file = self._memory_file(session_id)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        current = self.memory_file.read_text(encoding="utf-8")
-
-        # 기존 내용에 새 요약 추가
-        new_entry = f"\n### [{timestamp}] 업데이트\n{summary}\n"
-        updated = current + new_entry
-
-        # 200줄 제한 (OpenClaw 스타일)
-        lines = updated.split("\n")
+        updated = memory_file.read_text(encoding="utf-8") + f"\n### [{timestamp}] Update\n{summary}\n"
+        lines = updated.splitlines()
         if len(lines) > 200:
-            updated = "\n".join(lines[:200])
-            updated += "\n\n> (200줄 제한으로 이전 내용은 일별 로그를 참조하세요)\n"
+            updated = "\n".join(lines[:200]) + "\n\n> (Older lines were truncated.)\n"
+        memory_file.write_text(updated, encoding="utf-8")
+        metadata = self._load_metadata(session_id)
+        self._save_metadata(metadata, session_id)
+        return {"success": True, "message": "summary updated"}
 
-        self.memory_file.write_text(updated, encoding="utf-8")
-        self._save_metadata()
-
-        return {"success": True, "message": "장기 메모리 요약 업데이트 완료"}
-
-    def search_memory(self, query: str, max_results: int = 10) -> Dict[str, Any]:
-        """키워드 기반 메모리 검색"""
+    def search_memory(
+        self,
+        query: str,
+        max_results: int = 10,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         results = []
-        query_lower = query.lower()
-        keywords = query_lower.split()
+        keywords = query.lower().split()
+        memory_file = self._memory_file(session_id)
+        if memory_file.exists():
+            content = memory_file.read_text(encoding="utf-8")
+            if any(keyword in content.lower() for keyword in keywords):
+                results.append(
+                    {
+                        "source": "MEMORY.md",
+                        "type": "summary",
+                        "content": content[:2000],
+                        "relevance": "high",
+                    }
+                )
 
-        # MEMORY.md 검색
-        if self.memory_file.exists():
-            content = self.memory_file.read_text(encoding="utf-8")
-            if any(kw in content.lower() for kw in keywords):
-                results.append({
-                    "source": "MEMORY.md",
-                    "type": "summary",
-                    "content": content[:2000],
-                    "relevance": "high",
-                })
-
-        # 일별 로그 검색 (최근 30일)
-        daily_files = sorted(self.daily_dir.glob("*.md"), reverse=True)[:30]
+        daily_files = sorted(self._daily_dir(session_id).glob("*.md"), reverse=True)[:30]
         for daily_file in daily_files:
             try:
                 content = daily_file.read_text(encoding="utf-8")
-                if any(kw in content.lower() for kw in keywords):
-                    # 관련 섹션 추출
-                    sections = content.split("\n## ")
-                    matching_sections = []
-                    for section in sections:
-                        if any(kw in section.lower() for kw in keywords):
-                            matching_sections.append(section[:500])
-
-                    if matching_sections:
-                        results.append({
+            except Exception:
+                continue
+            if any(keyword in content.lower() for keyword in keywords):
+                sections = content.split("\n## ")
+                matching_sections = [
+                    section[:500]
+                    for section in sections
+                    if any(keyword in section.lower() for keyword in keywords)
+                ]
+                if matching_sections:
+                    results.append(
+                        {
                             "source": daily_file.name,
                             "type": "daily_log",
                             "content": "\n---\n".join(matching_sections[:3]),
                             "relevance": "medium",
-                        })
-            except Exception:
-                continue
-
+                        }
+                    )
             if len(results) >= max_results:
                 break
 
         return {
             "success": True,
             "query": query,
-            "results": results,
-            "count": len(results),
+            "session_id": self._resolve_session_id(session_id),
+            "results": results[:max_results],
+            "count": len(results[:max_results]),
         }
 
-    def get_daily_log(self, target_date: str = None) -> Dict[str, Any]:
-        """일별 로그 조회"""
+    def get_daily_log(
+        self,
+        target_date: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if target_date is None:
             target_date = date.today().isoformat()
-
-        daily_file = self.daily_dir / f"{target_date}.md"
-
+        daily_file = self._daily_dir(session_id) / f"{target_date}.md"
         if not daily_file.exists():
             return {
                 "success": True,
+                "session_id": self._resolve_session_id(session_id),
                 "date": target_date,
-                "content": "해당 날짜의 로그가 없습니다.",
+                "content": "No log for this date.",
                 "exists": False,
             }
-
         return {
             "success": True,
+            "session_id": self._resolve_session_id(session_id),
             "date": target_date,
             "content": daily_file.read_text(encoding="utf-8"),
             "exists": True,
         }
 
-    def get_summary(self) -> Dict[str, Any]:
-        """MEMORY.md 요약 반환"""
-        content = ""
-        if self.memory_file.exists():
-            content = self.memory_file.read_text(encoding="utf-8")
-
+    def get_summary(self, session_id: Optional[str] = None) -> Dict[str, Any]:
         return {
             "success": True,
-            "content": content,
-            "metadata": self.metadata,
+            "session_id": self._resolve_session_id(session_id),
+            "content": self._memory_file(session_id).read_text(encoding="utf-8"),
+            "metadata": self._load_metadata(session_id),
         }
 
-    def get_context_for_chat(self) -> str:
-        """채팅에 주입할 메모리 컨텍스트 생성"""
-        parts = []
+    def get_context_for_chat(self, session_id: Optional[str] = None) -> str:
+        parts: List[str] = []
+        summary = self._memory_file(session_id).read_text(encoding="utf-8")
+        if len(summary.strip()) > 50:
+            parts.append(f"<long_term_memory>\n{summary[:1500]}\n</long_term_memory>")
 
-        # MEMORY.md에서 핵심 정보
-        if self.memory_file.exists():
-            summary = self.memory_file.read_text(encoding="utf-8")
-            if len(summary.strip()) > 50:  # 의미 있는 내용이 있을 때만
-                parts.append(f"<장기_메모리>\n{summary[:1500]}\n</장기_메모리>")
-
-        # 오늘 대화 로그
-        today_file = self.daily_dir / f"{date.today().isoformat()}.md"
+        today_file = self._daily_dir(session_id) / f"{date.today().isoformat()}.md"
         if today_file.exists():
             today_log = today_file.read_text(encoding="utf-8")
             if len(today_log.strip()) > 50:
-                parts.append(f"<오늘_대화_기록>\n{today_log[:1000]}\n</오늘_대화_기록>")
+                parts.append(f"<today_log>\n{today_log[:1000]}\n</today_log>")
+        return "\n\n".join(parts)
 
-        return "\n\n".join(parts) if parts else ""
+    def clear_all(self, session_id: Optional[str] = None) -> Dict[str, Any]:
+        target_session_id = self._resolve_session_id(session_id)
+        session_dir = self._session_dir(target_session_id)
+        for path in sorted(session_dir.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        self._memory_file(target_session_id)
+        self._save_metadata({"total_entries": 0, "last_updated": None, "categories": {}}, target_session_id)
+        return {
+            "success": True,
+            "message": "memory cleared",
+            "session_id": target_session_id,
+        }
 
-    def clear_all(self) -> Dict[str, Any]:
-        """모든 메모리 초기화"""
-        # 일별 로그 삭제
-        for f in self.daily_dir.glob("*.md"):
-            f.unlink()
-
-        # MEMORY.md 초기화
-        self.memory_file.write_text(
-            "# MultiClaw 장기 메모리\n\n"
-            "이 파일은 중요한 대화 내용과 사용자 선호도를 기록합니다.\n\n"
-            "---\n\n",
-            encoding="utf-8",
-        )
-
-        # 메타데이터 초기화
-        self.metadata = {"total_entries": 0, "last_updated": None, "categories": {}}
-        self._save_metadata()
-
-        return {"success": True, "message": "모든 메모리가 초기화되었습니다"}
+    def get_global_stats(self) -> Dict[str, Any]:
+        total_entries = 0
+        session_count = 0
+        for session_dir in self.sessions_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+            session_count += 1
+            metadata = self._load_metadata(session_dir.name)
+            total_entries += metadata.get("total_entries", 0)
+        return {
+            "session_count": session_count,
+            "total_entries": total_entries,
+        }

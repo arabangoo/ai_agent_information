@@ -41,3 +41,7 @@ desktop.ini
 *.tmp
 *.temp
 .cache/
+
+# Runtime session data
+backend/data/memory/sessions/
+backend/data/browser/
