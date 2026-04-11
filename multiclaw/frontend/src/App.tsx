@@ -65,6 +65,42 @@ interface HistoryResponse {
   }>;
 }
 
+interface ToolConfigEntry {
+  name: string;
+  github_url: string;
+  description: string;
+  transport: "stdio" | "http";
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  capabilities: string[];
+  usage_scopes: string[];
+  source: string;
+}
+
+interface ToolManagerConfig {
+  config_path: string;
+  entries: ToolConfigEntry[];
+  raw_json: string;
+}
+
+interface ToolCheckResult {
+  valid: boolean;
+  summary: string;
+  checks: string[];
+}
+
+const EMPTY_TOOL_FORM = {
+  name: "",
+  transport: "stdio" as "stdio" | "http",
+  command: "",
+  args: "",
+  url: "",
+  description: "",
+  raw_json: "",
+};
+
 function toSessionId(value: string): string {
   const normalized = value.trim().replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^[._-]+|[._-]+$/g, "");
   return normalized || DEFAULT_SESSION_ID;
@@ -99,6 +135,12 @@ function App() {
     status: "idle" | "planning" | "voting" | "executing" | "done";
     output: string;
   }>({ status: "idle", output: "" });
+  const [showToolManager, setShowToolManager] = useState(false);
+  const [toolManagerConfig, setToolManagerConfig] = useState<ToolManagerConfig | null>(null);
+  const [toolForm, setToolForm] = useState(EMPTY_TOOL_FORM);
+  const [toolFormMode, setToolFormMode] = useState<"form" | "json">("form");
+  const [toolCheckResult, setToolCheckResult] = useState<ToolCheckResult | null>(null);
+  const [toolManagerLoading, setToolManagerLoading] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -502,13 +544,81 @@ function App() {
     }
   };
 
+  const handleOpenToolManager = async () => {
+    setShowToolManager(true);
+    setToolCheckResult(null);
+    setToolForm(EMPTY_TOOL_FORM);
+    try {
+      const response = await axios.get<ToolManagerConfig>(`${API_BASE_URL}/api/tool-manager/config`);
+      setToolManagerConfig(response.data);
+    } catch (error) {
+      console.error("Load tool manager config error:", error);
+    }
+  };
+
+  const handleRegisterTool = async () => {
+    setToolManagerLoading(true);
+    setToolCheckResult(null);
+    try {
+      const body =
+        toolFormMode === "json"
+          ? { name: "_", raw_json: toolForm.raw_json }
+          : {
+              name: toolForm.name,
+              transport: toolForm.transport,
+              command: toolForm.command,
+              args: toolForm.args.split(",").map((s) => s.trim()).filter(Boolean),
+              url: toolForm.url,
+              description: toolForm.description,
+            };
+      const response = await axios.post<ToolManagerConfig>(`${API_BASE_URL}/api/tool-manager/register`, body);
+      setToolManagerConfig(response.data);
+      setToolForm(EMPTY_TOOL_FORM);
+    } catch (error) {
+      console.error("Register tool error:", error);
+      window.alert(axios.isAxiosError(error) ? error.response?.data?.detail || error.message : "Registration failed.");
+    } finally {
+      setToolManagerLoading(false);
+    }
+  };
+
+  const handleCheckTool = async () => {
+    setToolManagerLoading(true);
+    setToolCheckResult(null);
+    try {
+      const body =
+        toolFormMode === "json"
+          ? { raw_json: toolForm.raw_json }
+          : {
+              name: toolForm.name,
+              transport: toolForm.transport,
+              command: toolForm.command,
+              args: toolForm.args.split(",").map((s) => s.trim()).filter(Boolean),
+              url: toolForm.url,
+            };
+      const response = await axios.post<ToolCheckResult>(`${API_BASE_URL}/api/tool-manager/check`, body);
+      setToolCheckResult(response.data);
+    } catch (error) {
+      console.error("Check tool error:", error);
+    } finally {
+      setToolManagerLoading(false);
+    }
+  };
+
+  const handleDeleteTool = async (name: string) => {
+    if (!window.confirm(`Delete MCP server "${name}"?`)) return;
+    try {
+      await axios.delete(`${API_BASE_URL}/api/tool-manager/${encodeURIComponent(name)}`);
+      const response = await axios.get<ToolManagerConfig>(`${API_BASE_URL}/api/tool-manager/config`);
+      setToolManagerConfig(response.data);
+    } catch (error) {
+      console.error("Delete tool error:", error);
+    }
+  };
+
   return (
     <div className="app-container">
       <header className="header multiclaw-header">
-        <div className="header-title-group">
-          <h1>MultiClaw</h1>
-          <div className="header-subtitle">Multi-AI voting agent</div>
-        </div>
         <div className="session-toolbar">
           <label className="session-label" htmlFor="session-id-input">
             Session
@@ -534,7 +644,14 @@ function App() {
           </button>
           <span className="session-active">Active: {sessionId}</span>
         </div>
+        <div className="header-title-group">
+          <h1>MultiClaw</h1>
+          <div className="header-subtitle">Multi-AI voting agent</div>
+        </div>
         <div className="header-buttons">
+          <button onClick={() => void handleOpenToolManager()} className="tool-manager-btn">
+            Tool Manager
+          </button>
           <button onClick={() => void handleOpenMemory()} className="memory-btn">
             Memory
           </button>
@@ -546,6 +663,124 @@ function App() {
           </button>
         </div>
       </header>
+
+      {showToolManager && (
+        <div className="modal-overlay" onClick={() => setShowToolManager(false)}>
+          <div className="modal-content tool-manager-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Tool Manager (MCP)</h2>
+              <button onClick={() => setShowToolManager(false)} className="modal-close">X</button>
+            </div>
+            <div className="modal-body">
+              <h3 className="tm-section-title">Registered Servers</h3>
+              {toolManagerConfig && toolManagerConfig.entries.length === 0 && (
+                <p className="no-documents">No MCP servers registered yet.</p>
+              )}
+              {toolManagerConfig && toolManagerConfig.entries.length > 0 && (
+                <div className="tm-server-list">
+                  {toolManagerConfig.entries.map((entry) => (
+                    <div key={entry.name} className="tm-server-item">
+                      <div className="tm-server-info">
+                        <span className="tm-server-name">{entry.name}</span>
+                        <span className="tm-server-transport">{entry.transport}</span>
+                        <span className="tm-server-cmd">
+                          {entry.transport === "stdio" ? `${entry.command} ${entry.args.join(" ")}`.trim() : entry.url}
+                        </span>
+                        {entry.description && <span className="tm-server-desc">{entry.description}</span>}
+                      </div>
+                      <button onClick={() => void handleDeleteTool(entry.name)} className="delete-doc-btn">Delete</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <h3 className="tm-section-title tm-section-add">Add Server</h3>
+              <div className="tm-form-tabs">
+                <button
+                  className={`tm-tab ${toolFormMode === "form" ? "tm-tab-active" : ""}`}
+                  onClick={() => setToolFormMode("form")}
+                >Form</button>
+                <button
+                  className={`tm-tab ${toolFormMode === "json" ? "tm-tab-active" : ""}`}
+                  onClick={() => setToolFormMode("json")}
+                >JSON</button>
+              </div>
+
+              {toolFormMode === "form" ? (
+                <div className="tm-form">
+                  <input
+                    className="tm-input"
+                    placeholder="Server name *"
+                    value={toolForm.name}
+                    onChange={(e) => setToolForm((f) => ({ ...f, name: e.target.value }))}
+                  />
+                  <select
+                    className="tm-input"
+                    value={toolForm.transport}
+                    onChange={(e) => setToolForm((f) => ({ ...f, transport: e.target.value as "stdio" | "http" }))}
+                  >
+                    <option value="stdio">stdio</option>
+                    <option value="http">http</option>
+                  </select>
+                  {toolForm.transport === "stdio" ? (
+                    <>
+                      <input
+                        className="tm-input"
+                        placeholder="Command (e.g. npx)"
+                        value={toolForm.command}
+                        onChange={(e) => setToolForm((f) => ({ ...f, command: e.target.value }))}
+                      />
+                      <input
+                        className="tm-input"
+                        placeholder="Args (comma-separated, e.g. -y, @scope/pkg)"
+                        value={toolForm.args}
+                        onChange={(e) => setToolForm((f) => ({ ...f, args: e.target.value }))}
+                      />
+                    </>
+                  ) : (
+                    <input
+                      className="tm-input"
+                      placeholder="URL (e.g. http://localhost:3000)"
+                      value={toolForm.url}
+                      onChange={(e) => setToolForm((f) => ({ ...f, url: e.target.value }))}
+                    />
+                  )}
+                  <input
+                    className="tm-input"
+                    placeholder="Description (optional)"
+                    value={toolForm.description}
+                    onChange={(e) => setToolForm((f) => ({ ...f, description: e.target.value }))}
+                  />
+                </div>
+              ) : (
+                <div className="tm-form">
+                  <textarea
+                    className="tm-input tm-textarea"
+                    placeholder={'Paste MCP server JSON, e.g.\n{\n  "mcpServers": {\n    "myTool": { "command": "npx", "args": ["-y", "@scope/pkg"] }\n  }\n}'}
+                    value={toolForm.raw_json}
+                    onChange={(e) => setToolForm((f) => ({ ...f, raw_json: e.target.value }))}
+                  />
+                </div>
+              )}
+
+              {toolCheckResult && (
+                <div className={`tm-check-result ${toolCheckResult.valid ? "tm-check-ok" : "tm-check-fail"}`}>
+                  <strong>{toolCheckResult.summary}</strong>
+                  <ul>{toolCheckResult.checks.map((c, i) => <li key={i}>{c}</li>)}</ul>
+                </div>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button onClick={() => void handleCheckTool()} className="tm-btn-secondary" disabled={toolManagerLoading}>
+                {toolManagerLoading ? "..." : "Check"}
+              </button>
+              <button onClick={() => void handleRegisterTool()} className="tm-btn-primary" disabled={toolManagerLoading}>
+                {toolManagerLoading ? "..." : "Register"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showDocuments && (
         <div className="modal-overlay" onClick={() => setShowDocuments(false)}>

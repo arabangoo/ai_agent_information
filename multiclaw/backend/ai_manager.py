@@ -14,7 +14,10 @@ BASE_SYSTEM_PROMPT = (
     "and perform web search through tools. "
     "If the conversation includes tool execution results, treat them as real completed actions. "
     "Do not falsely claim that you cannot access the local filesystem when tool results or agent context are provided. "
-    "Normal chat is already agent-enabled, so do not ask the user to switch to a separate /agent mode."
+    "Normal chat is already agent-enabled, so do not ask the user to switch to a separate /agent mode. "
+    "The current date and time is injected into this system prompt by the server at every request. "
+    "You MUST use that date/time directly when asked. "
+    "Never say you cannot access real-time information or the current date/time — it is already provided above."
 )
 
 AI_PERSONA_PROMPTS = {
@@ -103,8 +106,15 @@ class AIManager:
         return available
 
     def get_system_prompt(self, ai_name: str) -> str:
+        from datetime import datetime
+        now = datetime.now()
+        datetime_ctx = (
+            f"[시스템 제공 현재 시각] {now.strftime('%Y년 %m월 %d일 (%A) %H시 %M분')} (서버 로컬 시간)\n"
+            "이 날짜/시간은 서버가 매 요청마다 실시간으로 주입한 값입니다. "
+            "날짜나 시간을 물어보면 이 값을 그대로 답하세요. 코드를 생성하거나 '접근 불가'라고 말하지 마세요."
+        )
         persona = AI_PERSONA_PROMPTS.get(ai_name, "")
-        return f"{BASE_SYSTEM_PROMPT}\n\n{persona}".strip()
+        return f"{datetime_ctx}\n\n{BASE_SYSTEM_PROMPT}\n\n{persona}".strip()
 
     def format_context(
         self, context: Optional[str], files: Optional[List[Dict]] = None
@@ -196,13 +206,13 @@ class AIManager:
             return "GPT is unavailable. Check OPENAI_API_KEY."
         try:
             response = await self.openai_client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5-mini",
                 messages=[
                     {"role": "system", "content": self.get_system_prompt("GPT")},
                     {"role": "user", "content": message},
                 ],
-                temperature=0.7,
-                max_tokens=3000,
+                max_completion_tokens=3000,
+                reasoning_effort="medium",
             )
             return response.choices[0].message.content or ""
         except Exception as exc:
@@ -214,13 +224,13 @@ class AIManager:
             return
         try:
             stream = await self.openai_client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5-mini",
                 messages=[
                     {"role": "system", "content": self.get_system_prompt("GPT")},
                     {"role": "user", "content": message},
                 ],
-                temperature=0.7,
-                max_tokens=3000,
+                max_completion_tokens=3000,
+                reasoning_effort="medium",
                 stream=True,
             )
             async for chunk in stream:
@@ -235,7 +245,7 @@ class AIManager:
             return "Claude is unavailable. Check ANTHROPIC_API_KEY."
         try:
             response = await self.anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=3000,
                 temperature=0.7,
                 system=self.get_system_prompt("Claude"),
@@ -253,7 +263,7 @@ class AIManager:
             return
         try:
             async with self.anthropic_client.messages.stream(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=3000,
                 temperature=0.7,
                 system=self.get_system_prompt("Claude"),
@@ -287,7 +297,7 @@ class AIManager:
             response = await loop.run_in_executor(
                 None,
                 lambda: self.gemini_client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-2.5-flash-lite",
                     contents=message,
                     config=config,
                 ),
@@ -320,7 +330,7 @@ class AIManager:
             stream = await loop.run_in_executor(
                 None,
                 lambda: self.gemini_client.models.generate_content_stream(
-                    model="gemini-2.5-flash",
+                    model="gemini-2.5-flash-lite",
                     contents=message,
                     config=config,
                 ),

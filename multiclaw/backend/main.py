@@ -26,9 +26,14 @@ from ai_manager import AIManager
 from cancellation_manager import CancellationManager
 from file_search_manager import FileSearchManager
 from memory_manager import MemoryManager
+from agent_tools import TOOL_REGISTRY
+from mcp_runtime_service import MCPRuntimeService
+from mcp_tool_wrapper import refresh_mcp_tools
 from runtime_config import get_runtime_config
 from session_context import SessionStore
 from stream_events import event_payload, sse_data
+from tool_manager_models import MCPCallRequest, ToolCheckRequest, ToolRegistrationRequest
+from tool_manager_service import ToolManagerService
 from tool_policy import ToolPolicy
 from voting_system import VotingSystem
 
@@ -52,6 +57,8 @@ tool_policy = ToolPolicy(runtime_config)
 voting_system = VotingSystem(ai_manager)
 session_store = SessionStore(runtime_config)
 cancellation_manager = CancellationManager()
+tool_manager_service = ToolManagerService()
+mcp_runtime_service = MCPRuntimeService()
 agent_executor = AgentExecutor(
     ai_manager=ai_manager,
     voting_system=voting_system,
@@ -179,6 +186,8 @@ async def startup_event():
     print("MultiClaw starting")
     print(f"Available AIs: {', '.join(ai_manager.get_available_ais())}")
     print(f"Memory root: {memory_manager.base_dir}")
+    count = await asyncio.to_thread(refresh_mcp_tools, TOOL_REGISTRY, mcp_runtime_service)
+    print(f"MCP tools loaded: {count}")
 
 
 @app.get("/health")
@@ -194,6 +203,7 @@ async def health_check():
         "session_count": history_stats["session_count"],
         "memory_entries": memory_stats["total_entries"],
         "registered_tools": get_registered_tools(),
+        "mcp_servers": len(tool_manager_service.list_entries()),
     }
 
 
@@ -468,6 +478,52 @@ async def delete_document(document_id: str):
 @app.delete("/api/documents")
 async def clear_all_documents():
     return await file_search_manager.clear_all_documents()
+
+
+# ---------------------------------------------------------------------------
+# Tool Manager (MCP) endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/tool-manager/config")
+def get_tool_manager_config():
+    return tool_manager_service.get_config()
+
+
+@app.post("/api/tool-manager/register")
+def register_tool(request: ToolRegistrationRequest):
+    result = tool_manager_service.register(request)
+    refresh_mcp_tools(TOOL_REGISTRY, mcp_runtime_service)
+    return result
+
+
+@app.post("/api/tool-manager/check")
+def check_tool(request: ToolCheckRequest):
+    return tool_manager_service.check(request)
+
+
+@app.delete("/api/tool-manager/{name}")
+def delete_tool(name: str):
+    result = tool_manager_service.delete(name)
+    refresh_mcp_tools(TOOL_REGISTRY, mcp_runtime_service)
+    return result
+
+
+@app.get("/api/tool-manager/{name}/tools")
+def list_mcp_tools(name: str):
+    try:
+        tools = mcp_runtime_service.list_tools(name)
+        return {"server_name": name, "tools": tools, "success": True}
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
+@app.post("/api/tool-manager/{name}/call")
+def call_mcp_tool(name: str, request: MCPCallRequest):
+    result = mcp_runtime_service.call_tool(name, request.tool_name, request.arguments)
+    if not result.success:
+        raise HTTPException(500, result.message)
+    return result
 
 
 if __name__ == "__main__":

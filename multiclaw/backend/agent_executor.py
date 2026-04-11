@@ -26,11 +26,21 @@ from tool_policy import ToolPolicy
 from voting_system import VotingSystem
 
 
+# 파괴적/위험 작업만 투표 필요 — 이외 모든 도구는 자동 승인
+VOTE_REQUIRED_TOOLS = frozenset({
+    "write_file",
+    "run_command",
+    "kill_process",
+    "git_run",
+})
+
+
 PLAN_PROMPT_TEMPLATE = """당신은 MultiClaw의 로컬 시스템 에이전트 플래너입니다.
 MultiClaw는 로컬 파일 읽기/쓰기, 디렉토리 조회, 시스템 명령 실행, 웹 검색을 실제로 수행할 수 있습니다.
+또한 MCP(Model Context Protocol) 서버에 연결된 외부 도구도 사용할 수 있습니다.
 사용자가 파일/폴더/경로/명령/검색을 요청하면 도구를 써야 하며, 로컬 시스템 접근이 불가능하다고 말하면 안 됩니다.
 
-사용 가능한 도구:
+사용 가능한 도구 (이름을 그대로 "tool" 필드에 사용):
 {tools_description}
 
 사용자 요청: {user_message}
@@ -39,6 +49,7 @@ MultiClaw는 로컬 파일 읽기/쓰기, 디렉토리 조회, 시스템 명령 
 
 중요 규칙:
 - 파일, 폴더, 경로, 드라이브(C:\\ 등), 확장자, 생성/수정/삭제/읽기/목록/검색 요청이 있으면 반드시 도구 계획을 만드세요.
+- MCP 도구는 이름이 "ServerName__tool_name" 형식입니다. params는 해당 도구의 스키마에 맞게 작성하세요.
 - 일반 대화가 아닌 이상 "도구 없이 답변"으로 빼지 마세요.
 - 상대 경로와 절대 경로를 모두 사용할 수 있습니다.
 - JSON 외 텍스트를 절대 출력하지 마세요.
@@ -386,9 +397,7 @@ class AgentExecutor:
                 result["summary"] = "agent plan validation failed"
                 result["pipeline"]["policy"] = "completed"
                 result["pipeline"]["execute"] = "failed"
-                self._audit_log(session_context, user_message, result)
-                result["pipeline"]["audit"] = "completed"
-                return result
+                break
 
             policy_decision = self.tool_policy.assess(step["tool"], step["params"])
             step["policy"] = {
@@ -414,33 +423,40 @@ class AgentExecutor:
                 result["summary"] = "agent request blocked by policy"
                 result["pipeline"]["policy"] = "completed"
                 result["pipeline"]["execute"] = "failed"
-                self._audit_log(session_context, user_message, result)
-                result["pipeline"]["audit"] = "completed"
-                return result
+                break
 
             step["params"] = policy_decision.normalized_params
 
-            vote_result = await self.voting_system.conduct_vote(
-                user_command=user_message,
-                tool_name=step["tool"],
-                parameters=step["params"],
-            )
-            self._check_cancelled(session_context)
-            step["vote"] = vote_result
-            vote_summaries.append(f"step {step['step']} ({step['tool']}): {vote_result['summary']}")
-
-            if not vote_result["approved"]:
-                step["result"] = {
-                    "success": False,
-                    "error": f"vote rejected: {vote_result['summary']}",
+            if step["tool"] not in VOTE_REQUIRED_TOOLS:
+                step["vote"] = {
+                    "approved": True,
+                    "approve_count": 3,
+                    "reject_count": 0,
+                    "total_voters": 3,
+                    "votes": [],
+                    "summary": "auto-approved",
                 }
-                result["approved"] = False
-                result["summary"] = "agent request rejected by vote"
-                result["pipeline"]["policy"] = "completed"
-                result["pipeline"]["execute"] = "failed"
-                self._audit_log(session_context, user_message, result)
-                result["pipeline"]["audit"] = "completed"
-                return result
+                vote_summaries.append(f"step {step['step']} ({step['tool']}): auto-approved")
+            else:
+                vote_result = await self.voting_system.conduct_vote(
+                    user_command=user_message,
+                    tool_name=step["tool"],
+                    parameters=step["params"],
+                )
+                self._check_cancelled(session_context)
+                step["vote"] = vote_result
+                vote_summaries.append(f"step {step['step']} ({step['tool']}): {vote_result['summary']}")
+
+                if not vote_result["approved"]:
+                    step["result"] = {
+                        "success": False,
+                        "error": f"vote rejected: {vote_result['summary']}",
+                    }
+                    result["approved"] = False
+                    result["summary"] = "agent request rejected by vote"
+                    result["pipeline"]["policy"] = "completed"
+                    result["pipeline"]["execute"] = "failed"
+                    break
 
             tool_result = await execute_tool(
                 step["tool"],
@@ -463,17 +479,18 @@ class AgentExecutor:
                 result["summary"] = "tool execution failed"
                 result["pipeline"]["policy"] = "completed"
                 result["pipeline"]["execute"] = "failed"
-                self._audit_log(session_context, user_message, result)
-                result["pipeline"]["audit"] = "completed"
-                return result
+                break
 
-        result["pipeline"]["policy"] = "completed"
-        result["pipeline"]["execute"] = "completed"
+        if result["pipeline"].get("execute") != "failed":
+            result["pipeline"]["policy"] = "completed"
+            result["pipeline"]["execute"] = "completed"
+
         self._check_cancelled(session_context)
         result["ai_responses"] = await self._generate_final_response(
             user_message, execution_results, vote_summaries
         )
-        result["summary"] = f"agent work completed ({len(result['steps'])} steps)"
+        if result["pipeline"].get("execute") != "failed":
+            result["summary"] = f"agent work completed ({len(result['steps'])} steps)"
         self._audit_log(session_context, user_message, result)
         result["pipeline"]["audit"] = "completed"
         return result
