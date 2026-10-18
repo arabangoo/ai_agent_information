@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-
 DEFAULT_BLOCKED_COMMANDS = (
     "rm -rf /",
     "rm -rf /*",
@@ -44,6 +43,7 @@ class RuntimeConfig:
     max_command_stdout_chars: int = 20_000
     max_command_stderr_chars: int = 5_000
     max_read_chars: int = 50_000
+    parallel_search_enabled: bool = False
     max_upload_bytes: int = 100 * 1024 * 1024
     allowed_upload_extensions: tuple[str, ...] = (
         ".pdf",
@@ -71,6 +71,8 @@ class RuntimeConfig:
             data_root=data_root,
             memory_root=memory_root,
             default_session_id=default_session_id,
+            parallel_search_enabled=os.getenv("MULTICLAW_PARALLEL_SEARCH", "").strip().lower()
+            in {"1", "true", "yes", "on"},
         )
 
 

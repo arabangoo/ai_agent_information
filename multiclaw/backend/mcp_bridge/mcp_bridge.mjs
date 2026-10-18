@@ -38,7 +38,13 @@ async function withTimeout(promise, ms, label) {
 
 function buildTransport(server) {
   if (server.transport === 'http') {
-    return new StreamableHTTPClientTransport(new URL(server.url))
+    return new StreamableHTTPClientTransport(new URL(server.url), {
+      requestInit: {
+        headers: {
+          'User-Agent': 'MultiClaw/2.0.0 (+https://github.com/arabangoo/ai_agent_information)',
+        },
+      },
+    })
   }
 
   const env = {
@@ -166,4 +172,4 @@ async function main() {
   }
 }
 
-await main()
+await main().catch(error => fail(error instanceof Error ? error.message : String(error)))

@@ -206,6 +206,39 @@ MCP(Model Context Protocol) 서버를 등록하면 에이전트가 사용하는 
 
 MCP 서버 설정은 `tool_manager_config.json`에 저장되며, 서버 재시작 시 자동으로 로드됩니다.
 
+#### Parallel Search MCP (선택 사항)
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)를 사용하면
+Parallel 계정이나 API 키 없이 웹 검색과 페이지 본문 추출을 에이전트 도구로 사용할 수 있습니다.
+검색은 무료 익명 엔드포인트의 Fast 모드를 사용합니다. 기본 `ddgs` 검색은 그대로 유지됩니다.
+
+`backend/.env`에 아래 설정을 추가하고 백엔드를 재시작하세요.
+
+```env
+MULTICLAW_PARALLEL_SEARCH=1
+```
+
+기존 MCP 브리지가 처음 연결할 때 Node.js SDK를 준비합니다. 미리 설치하려면
+`backend/mcp_bridge`에서 `npm ci`를 실행하세요 (Node.js 18+ 및 npm 필요).
+연결되면 `parallel__web_search`, `parallel__web_fetch`가 자동 등록됩니다.
+예를 들어 **“Parallel로 Python 최신 릴리스 정보를 검색하고 공식 페이지를 읽어줘”**라고 요청하세요.
+도구 입력 스키마는 플래너에 전달되며, 직접 호출할 때는 다음 인수를 사용할 수 있습니다.
+
+```json
+{"tool": "parallel__web_search", "params": {"objective": "Find the latest Python release", "search_queries": ["Python latest release official"]}}
+{"tool": "parallel__web_fetch", "params": {"urls": ["https://www.python.org/downloads/"]}}
+```
+
+프리셋은 저장된 MCP 설정을 수정하지 않습니다. `parallel`이라는 저장된 서버가 있으면
+해당 설정이 우선하며, 연결 실패 시 다른 서버나 `ddgs`로 자동 전환하지 않습니다.
+프리셋을 끄려면 `MULTICLAW_PARALLEL_SEARCH=0`으로 설정하고 재시작하세요.
+직접 등록한 서버는 이 설정과 별도로 유지됩니다. 익명 서비스의 사용량 제한, 연결 오류,
+시간 초과는 도구 오류로 반환되며, 실행 중단 시 HTTP MCP 브리지 프로세스도 종료됩니다.
+
+브리지와 에이전트 경로의 회귀 검사는 `backend/mcp_bridge`에서 `npm ci`를 실행한 뒤
+`backend`에서 `python -m unittest discover -s tests -v`로 실행할 수 있습니다.
+이 검사는 로컬 MCP 서버와 고정된 모델 응답을 사용하며 실제 LLM 키나 브라우저가 필요하지 않습니다.
+
 ### 실행 중단 / 취소
 
 - 프론트 입력 영역에 **Stop** 버튼이 존재합니다.

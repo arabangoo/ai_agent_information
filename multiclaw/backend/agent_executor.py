@@ -16,15 +16,14 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List
 
-from ai_manager import AIManager
 from agent_tools import TOOL_REGISTRY, execute_tool, get_tools_description
+from ai_manager import AIManager
 from cancellation_manager import CancellationManager
 from memory_manager import MemoryManager
 from runtime_config import RuntimeConfig, get_runtime_config
 from session_context import SessionContext
 from tool_policy import ToolPolicy
 from voting_system import VotingSystem
-
 
 # 파괴적/위험 작업만 투표 필요 — 이외 모든 도구는 자동 승인
 VOTE_REQUIRED_TOOLS = frozenset({
@@ -136,6 +135,10 @@ class AgentExecutor:
             if isinstance(step, dict)
         ]
         if "web_search" in planned_tools or "fetch_url" in planned_tools:
+            return False
+        # Keep an explicit MCP search/fetch plan, including validation failures.
+        # Replacing it with ddgs would hide the selected provider's failure.
+        if any(isinstance(name, str) and name.endswith(("__web_search", "__web_fetch")) for name in planned_tools):
             return False
         return self._looks_like_live_web_query(user_message)
 
