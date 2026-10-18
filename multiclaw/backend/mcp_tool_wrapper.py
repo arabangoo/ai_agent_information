@@ -8,7 +8,7 @@ exactly like built-in tools.
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 from typing import Any, Dict, List
 
@@ -33,7 +33,7 @@ class MCPDynamicTool:
         self.server_name = server_name
         self.mcp_tool_name = tool_name
         self.name = f"{server_name}__{tool_name}"
-        self.description = f"[MCP:{server_name}] {description}"
+        self.description = f"[MCP:{server_name}] {description}\nInput schema: {json.dumps(input_schema, ensure_ascii=False)}"
         self.source = f"{_MCP_SOURCE_PREFIX}{server_name}"
         self._input_schema = input_schema
         self._mcp_runtime = mcp_runtime
@@ -53,8 +53,7 @@ class MCPDynamicTool:
     async def execute(
         self, params: Dict[str, Any], context: ToolExecutionContext
     ) -> Dict[str, Any]:
-        result = await asyncio.to_thread(
-            self._mcp_runtime.call_tool,
+        result = await self._mcp_runtime.call_tool_async(
             self.server_name,
             self.mcp_tool_name,
             params,
